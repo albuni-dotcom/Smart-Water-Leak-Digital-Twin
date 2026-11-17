@@ -1,185 +1,746 @@
+
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 #include <Adafruit_ADS1X15.h>
+#include <math.h>
+#include <string.h>
 
-// غيّر هذه القيمة إلى false عند رفع الكود على القطع الحقيقية (ADS1115)
 #define SIMULATION_MODE true
+#define MQTT_ENABLED true
 
-// تعريف أطراف حساسات التدفق (Interrupt Pins)
 #define FLOW_MAIN_PIN 27
-#define FLOW_ZA_PIN   26
-#define FLOW_ZB_PIN   25
-#define FLOW_ZC_PIN   33
+#define FLOW_ZA_PIN 26
+#define FLOW_ZB_PIN 25
+#define FLOW_ZC_PIN 33
 
-// تعريف أطراف صمامات العزل (Relay Pins)
-#define VALVE_A_PIN   16
-#define VALVE_B_PIN   17
-#define VALVE_C_PIN   18
+#define VALVE_A_PIN 16
+#define VALVE_B_PIN 17
+#define VALVE_C_PIN 18
+
+#define RELAY_ACTIVE_HIGH true
+
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+const char* MQTT_SERVER = "192.168.1.100";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASSWORD = "";
+
+const char* MQTT_CLIENT_ID = "smart_water_esp32";
+const char* MQTT_COMMAND_TOPIC = "smartwater/device/cmd";
+const char* MQTT_TELEMETRY_TOPIC = "smartwater/device/telemetry";
+const char* MQTT_STATUS_TOPIC = "smartwater/device/status";
+
+const float CAL_YFS201 = 450.0f;
+const float CAL_YFS401 = 5880.0f;
+
+const float MAIN_FLOW_ERROR_LIMIT = 0.8f;
+const float MAIN_PRESSURE_LIMIT = 0.80f;
+const float ZONE_PRESSURE_LIMIT = 0.65f;
+const float MICRO_LEAK_PRESSURE_LIMIT = 0.88f;
+
+const uint32_t SAMPLE_INTERVAL = 1000;
+const uint32_t MQTT_RECONNECT_INTERVAL = 5000;
+const uint8_t WINDOW_SIZE = 10;
+const uint8_t ALARM_CONFIRMATION_COUNT = 3;
 
 Adafruit_ADS1115 ads;
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
-// عدادات النبضات اللحظية
 volatile uint32_t pulsesMain = 0;
 volatile uint32_t pulsesZA = 0;
 volatile uint32_t pulsesZB = 0;
 volatile uint32_t pulsesZC = 0;
 
-// معاملات التحويل المعتمدة (Pulse per Liter)
-const float CAL_YFS201 = 450.0;  // الخط الرئيسي
-const float CAL_YFS401 = 5880.0; // الفروع الثلاثة
+const uint8_t valvePins[3] = {
+    VALVE_A_PIN,
+    VALVE_B_PIN,
+    VALVE_C_PIN
+};
 
-// مرشح المتوسط المتحرك (نافذة 10 قراءات)
-const int WINDOW_SIZE = 10;
-float pMainBuf[WINDOW_SIZE] = {0};
-float pZoneBuf[3][WINDOW_SIZE] = {0};
-int bufIdx = 0;
+const uint8_t simulationPressurePins[4] = {
+    36, 39, 34, 35
+};
 
-float pRefFull = 15.0; // كيلوباسكال (يتم تحديثه بالمعايرة الذاتية)
-float baselineRatios[3] = {0.85, 0.85, 0.85};
-bool valveState[3] = {true, true, true}; // true = مفتوح
+bool valveState[3] = {
+    false,
+    false,
+    false
+};
 
-// دوال المقاطعة لعد النبضات بدقة
-void IRAM_ATTR isrMain() { pulsesMain = pulsesMain + 1; }
-void IRAM_ATTR isrZA()   { pulsesZA = pulsesZA + 1; }
-void IRAM_ATTR isrZB()   { pulsesZB = pulsesZB + 1; }
-void IRAM_ATTR isrZC()   { pulsesZC = pulsesZC + 1; }
+bool alarmActive = false;
+bool sensorReady = true;
+bool mqttConnected = false;
+
+float pMainBuffer[WINDOW_SIZE] = {};
+float pZoneBuffer[3][WINDOW_SIZE] = {};
+
+float pMain = 0.0f;
+float pZones[3] = {};
+float qMain = 0.0f;
+float qZones[3] = {};
+
+float pRefFull = 15.0f;
+float baselineRatios[3] = {
+    0.85f,
+    0.85f,
+    0.85f
+};
+
+uint8_t bufferIndex = 0;
+uint8_t bufferCount = 0;
+
+uint8_t mainLeakCounter = 0;
+uint8_t zoneLeakCounter[3] = {};
+
+uint32_t lastSampleTime = 0;
+uint32_t lastMqttReconnect = 0;
+
+String lastAlarm = "NONE";
+
+void IRAM_ATTR isrMain() {
+    pulsesMain++;
+}
+
+void IRAM_ATTR isrZA() {
+    pulsesZA++;
+}
+
+void IRAM_ATTR isrZB() {
+    pulsesZB++;
+}
+
+void IRAM_ATTR isrZC() {
+    pulsesZC++;
+}
+
+void writeRelay(uint8_t pin, bool enabled) {
+    if (RELAY_ACTIVE_HIGH) {
+        digitalWrite(pin, enabled ? HIGH : LOW);
+    } else {
+        digitalWrite(pin, enabled ? LOW : HIGH);
+    }
+}
+
+void setValve(uint8_t zone, bool open) {
+    if (zone >= 3) {
+        return;
+    }
+
+    writeRelay(valvePins[zone], open);
+    valveState[zone] = open;
+}
+
+void closeAllValves() {
+    for (uint8_t i = 0; i < 3; i++) {
+        setValve(i, false);
+    }
+}
+
+void openAllValves() {
+    if (alarmActive || !sensorReady) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < 3; i++) {
+        setValve(i, true);
+    }
+}
 
 float readPressureKPa(uint8_t channel) {
+    if (channel >= 4) {
+        return 0.0f;
+    }
+
 #if SIMULATION_MODE
-  const int simPins[4] = {36, 39, 34, 35}; // أطراف المقاومات المتغيرة في Wokwi
-  int raw = analogRead(simPins[channel]);
-  // تحويل قراءة المنزلق (0 - 4095) إلى ضغط (0 - 20 kPa)
-  return (raw / 4095.0) * 20.0;
+    int raw = analogRead(simulationPressurePins[channel]);
+    return (static_cast<float>(raw) / 4095.0f) * 20.0f;
 #else
-  int16_t adc = ads.readADC_SingleEnded(channel);
-  float voltage = ads.computeVolts(adc);
-  // معادلة تحويل XGZP6847A (0.5V - 4.5V -> 0 - 40 kPa)
-  float kpa = (voltage - 0.5) * (40.0 / 4.0);
-  return (kpa < 0.0) ? 0.0 : kpa;
+    int16_t raw = ads.readADC_SingleEnded(channel);
+    float voltage = ads.computeVolts(raw);
+    float pressure = (voltage - 0.5f) * 10.0f;
+
+    if (pressure < 0.0f) {
+        pressure = 0.0f;
+    }
+
+    if (pressure > 40.0f) {
+        pressure = 40.0f;
+    }
+
+    return pressure;
 #endif
 }
 
-float getMovingAvg(float* buffer) {
-  float sum = 0;
-  for (int i = 0; i < WINDOW_SIZE; i++) sum += buffer[i];
-  return sum / WINDOW_SIZE;
+float calculateAverage(const float* buffer, uint8_t count) {
+    if (count == 0) {
+        return 0.0f;
+    }
+
+    float total = 0.0f;
+
+    for (uint8_t i = 0; i < count; i++) {
+        total += buffer[i];
+    }
+
+    return total / static_cast<float>(count);
 }
 
-void setValve(int zoneIndex, bool open) {
-  const int pins[3] = {VALVE_A_PIN, VALVE_B_PIN, VALVE_C_PIN};
-  digitalWrite(pins[zoneIndex], open ? HIGH : LOW);
-  valveState[zoneIndex] = open;
+float calculateFlow(uint32_t pulses, float pulsesPerLiter) {
+    return (static_cast<float>(pulses) / pulsesPerLiter) * 60.0f;
 }
 
-void selfCalibration() {
-  Serial.println("[CALIBRATION] Closing all valves for self-calibration...");
-  for (int i = 0; i < 3; i++) setValve(i, false);
-  delay(2000); // انتظار استقرار موجة الضغط
+void updatePressureReadings() {
+    pMainBuffer[bufferIndex] = readPressureKPa(0);
 
-  float sumP = 0;
-  for (int i = 0; i < 20; i++) {
-    sumP += readPressureKPa(0);
-    delay(100);
-  }
-  pRefFull = sumP / 20.0;
-  float waterHeight = (pRefFull * 1000.0) / (1000.0 * 9.81); // بالمتر
+    for (uint8_t i = 0; i < 3; i++) {
+        pZoneBuffer[i][bufferIndex] = readPressureKPa(i + 1);
+    }
 
-  Serial.printf("[CALIBRATION] Done! P_main_ref = %.2f kPa | Water Head = %.2f m\n", pRefFull, waterHeight);
-  for (int i = 0; i < 3; i++) setValve(i, true); // إعادة فتح الصمامات
+    bufferIndex = (bufferIndex + 1) % WINDOW_SIZE;
+
+    if (bufferCount < WINDOW_SIZE) {
+        bufferCount++;
+    }
+
+    pMain = calculateAverage(pMainBuffer, bufferCount);
+
+    for (uint8_t i = 0; i < 3; i++) {
+        pZones[i] = calculateAverage(pZoneBuffer[i], bufferCount);
+    }
+}
+
+void calibratePressureReference() {
+    closeAllValves();
+    delay(1500);
+
+    float total = 0.0f;
+    const uint8_t readings = 20;
+
+    for (uint8_t i = 0; i < readings; i++) {
+        total += readPressureKPa(0);
+        delay(100);
+    }
+
+    pRefFull = total / static_cast<float>(readings);
+
+    if (pRefFull < 0.1f) {
+        pRefFull = 15.0f;
+    }
+
+    Serial.print("Pressure reference: ");
+    Serial.print(pRefFull, 2);
+    Serial.println(" kPa");
+
+    closeAllValves();
+}
+
+void publishStatus(const char* status) {
+#if MQTT_ENABLED
+    if (mqttClient.connected()) {
+        mqttClient.publish(MQTT_STATUS_TOPIC, status, true);
+    }
+#endif
+}
+
+void activateAlarm(const String& message) {
+    if (alarmActive) {
+        return;
+    }
+
+    alarmActive = true;
+    lastAlarm = message;
+
+    closeAllValves();
+
+    Serial.print("ALARM: ");
+    Serial.println(message);
+
+    publishStatus("ALARM");
+
+#if MQTT_ENABLED
+    if (mqttClient.connected()) {
+        String payload = "{\"alarm\":\"" + message + "\",\"active\":true}";
+        mqttClient.publish(MQTT_TELEMETRY_TOPIC, payload.c_str());
+    }
+#endif
+}
+
+void resetAlarm() {
+    alarmActive = false;
+    mainLeakCounter = 0;
+
+    for (uint8_t i = 0; i < 3; i++) {
+        zoneLeakCounter[i] = 0;
+    }
+
+    lastAlarm = "NONE";
+    closeAllValves();
+
+    Serial.println("Alarm reset. All valves remain closed.");
+    publishStatus("READY");
+}
+
+bool readJsonValue(const char* payload, const char* key, int& value) {
+    char searchKey[24];
+
+    snprintf(searchKey, sizeof(searchKey), "\"%s\"", key);
+
+    const char* position = strstr(payload, searchKey);
+
+    if (position == nullptr) {
+        return false;
+    }
+
+    position = strchr(position, ':');
+
+    if (position == nullptr) {
+        return false;
+    }
+
+    position++;
+
+    while (*position == ' ' || *position == '\t') {
+        position++;
+    }
+
+    if (strncmp(position, "true", 4) == 0) {
+        value = 1;
+        return true;
+    }
+
+    if (strncmp(position, "false", 5) == 0) {
+        value = 0;
+        return true;
+    }
+
+    if (*position == '1' || *position == '0') {
+        value = *position - '0';
+        return true;
+    }
+
+    return false;
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    if (strcmp(topic, MQTT_COMMAND_TOPIC) != 0) {
+        return;
+    }
+
+    char message[256];
+
+    if (length >= sizeof(message)) {
+        return;
+    }
+
+    memcpy(message, payload, length);
+    message[length] = '\0';
+
+    int value = 0;
+
+    if (readJsonValue(message, "RESET", value) && value == 1) {
+        resetAlarm();
+        return;
+    }
+
+    if (readJsonValue(message, "ALL", value)) {
+        if (value == 0) {
+            closeAllValves();
+        } else if (!alarmActive && sensorReady) {
+            openAllValves();
+        }
+    }
+
+    const char* zoneKeys[3] = {
+        "A",
+        "B",
+        "C"
+    };
+
+    for (uint8_t i = 0; i < 3; i++) {
+        if (readJsonValue(message, zoneKeys[i], value)) {
+            if (value == 0) {
+                setValve(i, false);
+            } else if (!alarmActive && sensorReady) {
+                setValve(i, true);
+            }
+        }
+    }
+
+    Serial.print("MQTT command received: ");
+    Serial.println(message);
+}
+
+void connectWiFi() {
+#if !SIMULATION_MODE
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    uint32_t startTime = millis();
+
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 20000) {
+        delay(250);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("WiFi connected: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("WiFi connection failed.");
+    }
+#endif
+}
+
+void reconnectMQTT() {
+#if MQTT_ENABLED && !SIMULATION_MODE
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    if (mqttClient.connected()) {
+        return;
+    }
+
+    if (millis() - lastMqttReconnect < MQTT_RECONNECT_INTERVAL) {
+        return;
+    }
+
+    lastMqttReconnect = millis();
+
+    bool connected;
+
+    if (strlen(MQTT_USER) > 0) {
+        connected = mqttClient.connect(
+            MQTT_CLIENT_ID,
+            MQTT_USER,
+            MQTT_PASSWORD
+        );
+    } else {
+        connected = mqttClient.connect(MQTT_CLIENT_ID);
+    }
+
+    if (connected) {
+        mqttConnected = true;
+        mqttClient.subscribe(MQTT_COMMAND_TOPIC);
+        publishStatus(alarmActive ? "ALARM" : "READY");
+        Serial.println("MQTT connected.");
+    } else {
+        mqttConnected = false;
+        Serial.print("MQTT connection failed: ");
+        Serial.println(mqttClient.state());
+    }
+#endif
+}
+
+void publishTelemetry() {
+    String payload = "{";
+
+    payload += "\"P_main\":";
+    payload += String(pMain, 2);
+
+    payload += ",\"Q_main\":";
+    payload += String(qMain, 3);
+
+    payload += ",\"ZA\":{\"P\":";
+    payload += String(pZones[0], 2);
+    payload += ",\"Q\":";
+    payload += String(qZones[0], 3);
+    payload += ",\"V\":";
+    payload += valveState[0] ? "1" : "0";
+    payload += "}";
+
+    payload += ",\"ZB\":{\"P\":";
+    payload += String(pZones[1], 2);
+    payload += ",\"Q\":";
+    payload += String(qZones[1], 3);
+    payload += ",\"V\":";
+    payload += valveState[1] ? "1" : "0";
+    payload += "}";
+
+    payload += ",\"ZC\":{\"P\":";
+    payload += String(pZones[2], 2);
+    payload += ",\"Q\":";
+    payload += String(qZones[2], 3);
+    payload += ",\"V\":";
+    payload += valveState[2] ? "1" : "0";
+    payload += "}";
+
+    payload += ",\"alarm\":";
+    payload += alarmActive ? "true" : "false";
+
+    payload += ",\"alarm_type\":\"";
+    payload += lastAlarm;
+    payload += "\"";
+
+    payload += ",\"sensor_ready\":";
+    payload += sensorReady ? "true" : "false";
+
+    payload += "}";
+
+    Serial.println(payload);
+
+#if MQTT_ENABLED && !SIMULATION_MODE
+    if (mqttClient.connected()) {
+        mqttClient.publish(
+            MQTT_TELEMETRY_TOPIC,
+            payload.c_str()
+        );
+    }
+#endif
+}
+
+void detectMainLeak() {
+    float sumZones = qZones[0] + qZones[1] + qZones[2];
+    float flowDifference = fabs(qMain - sumZones);
+
+    bool pressureDrop = (
+        pRefFull > 0.5f &&
+        pMain < pRefFull * MAIN_PRESSURE_LIMIT &&
+        sumZones < 0.5f
+    );
+
+    bool flowImbalance = (
+        qMain > 1.0f &&
+        flowDifference > MAIN_FLOW_ERROR_LIMIT
+    );
+
+    if (pressureDrop || flowImbalance) {
+        if (mainLeakCounter < ALARM_CONFIRMATION_COUNT) {
+            mainLeakCounter++;
+        }
+    } else {
+        mainLeakCounter = 0;
+    }
+
+    if (mainLeakCounter >= ALARM_CONFIRMATION_COUNT) {
+        activateAlarm("MAIN_MANIFOLD_LEAK");
+    }
+}
+
+void detectZoneLeaks() {
+    if (alarmActive) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!valveState[i]) {
+            zoneLeakCounter[i] = 0;
+            continue;
+        }
+
+        float ratio = 1.0f;
+
+        if (pMain > 0.5f) {
+            ratio = pZones[i] / pMain;
+        }
+
+        bool pressureRatioDrop = (
+            ratio < baselineRatios[i] * ZONE_PRESSURE_LIMIT
+        );
+
+        bool microLeak = (
+            qZones[i] < 0.05f &&
+            pRefFull > 0.5f &&
+            pZones[i] < pRefFull * MICRO_LEAK_PRESSURE_LIMIT
+        );
+
+        if (pressureRatioDrop || microLeak) {
+            if (zoneLeakCounter[i] < ALARM_CONFIRMATION_COUNT) {
+                zoneLeakCounter[i]++;
+            }
+        } else {
+            zoneLeakCounter[i] = 0;
+        }
+
+        if (zoneLeakCounter[i] >= ALARM_CONFIRMATION_COUNT) {
+            char alarmMessage[32];
+
+            snprintf(
+                alarmMessage,
+                sizeof(alarmMessage),
+                "ZONE_%c_LEAK",
+                'A' + i
+            );
+
+            setValve(i, false);
+
+            Serial.print("Zone leak detected: ");
+            Serial.println(alarmMessage);
+
+            lastAlarm = alarmMessage;
+
+            zoneLeakCounter[i] = 0;
+
+#if MQTT_ENABLED && !SIMULATION_MODE
+            if (mqttClient.connected()) {
+                String payload = "{\"alarm\":\"";
+                payload += alarmMessage;
+                payload += "\",\"zone\":\"";
+                payload += static_cast<char>('A' + i);
+                payload += "\",\"active\":true}";
+
+                mqttClient.publish(
+                    MQTT_TELEMETRY_TOPIC,
+                    payload.c_str()
+                );
+            }
+#endif
+        }
+    }
+}
+
+void readFlowSensors() {
+    uint32_t mainCount;
+    uint32_t zoneACount;
+    uint32_t zoneBCount;
+    uint32_t zoneCCount;
+
+    noInterrupts();
+
+    mainCount = pulsesMain;
+    zoneACount = pulsesZA;
+    zoneBCount = pulsesZB;
+    zoneCCount = pulsesZC;
+
+    pulsesMain = 0;
+    pulsesZA = 0;
+    pulsesZB = 0;
+    pulsesZC = 0;
+
+    interrupts();
+
+    qMain = calculateFlow(mainCount, CAL_YFS201);
+
+    qZones[0] = calculateFlow(zoneACount, CAL_YFS401);
+    qZones[1] = calculateFlow(zoneBCount, CAL_YFS401);
+    qZones[2] = calculateFlow(zoneCCount, CAL_YFS401);
+}
+
+void initializeSensors() {
+#if !SIMULATION_MODE
+    if (!ads.begin(0x48)) {
+        sensorReady = false;
+        closeAllValves();
+        Serial.println("ADS1115 initialization failed.");
+        return;
+    }
+
+    ads.setGain(GAIN_TWOTHIRDS);
+    ads.setDataRate(RATE_ADS1115_128SPS);
+#else
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+#endif
+
+    sensorReady = true;
+}
+
+void initializePins() {
+    for (uint8_t i = 0; i < 3; i++) {
+        pinMode(valvePins[i], OUTPUT);
+    }
+
+    closeAllValves();
+
+    pinMode(FLOW_MAIN_PIN, INPUT_PULLUP);
+    pinMode(FLOW_ZA_PIN, INPUT_PULLUP);
+    pinMode(FLOW_ZB_PIN, INPUT_PULLUP);
+    pinMode(FLOW_ZC_PIN, INPUT_PULLUP);
+
+    attachInterrupt(
+        digitalPinToInterrupt(FLOW_MAIN_PIN),
+        isrMain,
+        FALLING
+    );
+
+    attachInterrupt(
+        digitalPinToInterrupt(FLOW_ZA_PIN),
+        isrZA,
+        FALLING
+    );
+
+    attachInterrupt(
+        digitalPinToInterrupt(FLOW_ZB_PIN),
+        isrZB,
+        FALLING
+    );
+
+    attachInterrupt(
+        digitalPinToInterrupt(FLOW_ZC_PIN),
+        isrZC,
+        FALLING
+    );
 }
 
 void setup() {
-  Serial.begin(115200);
-  Wire.begin(21, 22);
+    Serial.begin(115200);
 
-  pinMode(VALVE_A_PIN, OUTPUT);
-  pinMode(VALVE_B_PIN, OUTPUT);
-  pinMode(VALVE_C_PIN, OUTPUT);
+    delay(500);
 
-  pinMode(FLOW_MAIN_PIN, INPUT_PULLUP);
-  pinMode(FLOW_ZA_PIN, INPUT_PULLUP);
-  pinMode(FLOW_ZB_PIN, INPUT_PULLUP);
-  pinMode(FLOW_ZC_PIN, INPUT_PULLUP);
+    initializePins();
 
-  attachInterrupt(digitalPinToInterrupt(FLOW_MAIN_PIN), isrMain, FALLING);
-  attachInterrupt(digitalPinToInterrupt(FLOW_ZA_PIN), isrZA, FALLING);
-  attachInterrupt(digitalPinToInterrupt(FLOW_ZB_PIN), isrZB, FALLING);
-  attachInterrupt(digitalPinToInterrupt(FLOW_ZC_PIN), isrZC, FALLING);
+    Wire.begin(21, 22);
 
-#if !SIMULATION_MODE
-  if (!ads.begin(0x48)) {
-    Serial.println("[ERROR] Failed to initialize ADS1115!");
-  }
-  ads.setGain(GAIN_TWOTHIRDS); // نطاق ±6.144V
-#else
-  Serial.println("[INFO] Running in Wokwi SIMULATION_MODE (Potentiometers active).");
+    initializeSensors();
+
+    if (!sensorReady) {
+        closeAllValves();
+        return;
+    }
+
+    calibratePressureReference();
+
+#if MQTT_ENABLED && !SIMULATION_MODE
+    connectWiFi();
+
+    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setBufferSize(512);
+
+    reconnectMQTT();
 #endif
 
-  selfCalibration();
+    Serial.println("Smart Water Leak Detection System Ready.");
+    Serial.println("All valves are initially closed.");
 }
 
 void loop() {
-  static unsigned long lastMillis = 0;
-  if (millis() - lastMillis >= 1000) { // تحديث كل 1 ثانية
-    noInterrupts();
-    uint32_t cMain = pulsesMain; pulsesMain = 0;
-    uint32_t cZA   = pulsesZA;   pulsesZA = 0;
-    uint32_t cZB   = pulsesZB;   pulsesZB = 0;
-    uint32_t cZC   = pulsesZC;   pulsesZC = 0;
-    interrupts();
-
-    // حساب التدفق بوحدة L/min
-    float qMain = (cMain / CAL_YFS201) * 60.0;
-    float qZones[3] = {
-      (cZA / CAL_YFS401) * 60.0,
-      (cZB / CAL_YFS401) * 60.0,
-      (cZC / CAL_YFS401) * 60.0
-    };
-
-    // قراءة الضغوط وتحديث مرشح المتوسط المتحرك
-    pMainBuf[bufIdx] = readPressureKPa(0);
-    for (int i = 0; i < 3; i++) {
-      pZoneBuf[i][bufIdx] = readPressureKPa(i + 1);
-    }
-    bufIdx = (bufIdx + 1) % WINDOW_SIZE;
-
-    float pMain = getMovingAvg(pMainBuf);
-    float pZones[3] = {
-      getMovingAvg(pZoneBuf[0]),
-      getMovingAvg(pZoneBuf[1]),
-      getMovingAvg(pZoneBuf[2])
-    };
-
-    // --- تطبيق قواعد كشف التسرب الأربعة ---
-    // 1. كشف تسرب المشعب الرئيسي (القيمة المطلقة + موازنة التدفق)
-    float sumQ = qZones[0] + qZones[1] + qZones[2];
-    if ((pMain < pRefFull * 0.80 && sumQ < 0.5) || abs(qMain - sumQ) > 0.5) {
-      Serial.println("[ALERT] MAIN MANIFOLD LEAK DETECTED! Isolating all zones.");
-      for (int i = 0; i < 3; i++) setValve(i, false);
+    if (!sensorReady) {
+        closeAllValves();
+        delay(1000);
+        return;
     }
 
-    // 2. كشف تسرب الفروع (نسبة الضغط + منطقة العمى Dead-band)
-    for (int i = 0; i < 3; i++) {
-      if (!valveState[i]) continue;
-      float ratio = (pMain > 0.5) ? (pZones[i] / pMain) : 1.0;
-
-      // الشرط 1: انخفاض نسبة الضغط P_zone / P_main
-      if (ratio < baselineRatios[i] * 0.65) {
-        Serial.printf("[ALERT] LEAK IN ZONE %c (Ratio Drop: %.2f)! Closing Valve.\n", 'A' + i, ratio);
-        setValve(i, false);
-      }
-      // الشرط 4: منطقة العمى (التدفق صفر ولكن الضغط ينخفض تدريجياً)
-      else if (qZones[i] == 0.0 && pZones[i] < pRefFull * 0.88) {
-        Serial.printf("[ALERT] MICRO-LEAK IN ZONE %c (Dead-band Pressure Drop)! Closing Valve.\n", 'A' + i);
-        setValve(i, false);
-      }
+#if MQTT_ENABLED && !SIMULATION_MODE
+    if (WiFi.status() != WL_CONNECTED) {
+        connectWiFi();
     }
 
-    // طباعة حزمة البيانات بصيغة JSON (جاهزة للإرسال عبر MQTT)
-    Serial.printf("{\"P_main\":%.2f,\"Q_main\":%.2f,\"ZA\":{\"P\":%.2f,\"Q\":%.2f,\"V\":%d},\"ZB\":{\"P\":%.2f,\"Q\":%.2f,\"V\":%d},\"ZC\":{\"P\":%.2f,\"Q\":%.2f,\"V\":%d}}\n",
-                  pMain, qMain, pZones[0], qZones[0], valveState[0], pZones[1], qZones[1], valveState[1], pZones[2], qZones[2], valveState[2]);
+    reconnectMQTT();
 
-    lastMillis = millis();
-  }
+    if (mqttClient.connected()) {
+        mqttClient.loop();
+    }
+#endif
+
+    uint32_t currentTime = millis();
+
+    if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
+        lastSampleTime = currentTime;
+
+        readFlowSensors();
+        updatePressureReadings();
+
+        if (!alarmActive) {
+            detectMainLeak();
+            detectZoneLeaks();
+        }
+
+        publishTelemetry();
+    }
 }
 
