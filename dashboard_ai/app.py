@@ -1,6 +1,7 @@
 from anomaly import detect_anomaly, reset_detector
 
 import json
+import queue
 import time
 from datetime import datetime
 
@@ -208,6 +209,18 @@ if "last_mqtt_message" not in st.session_state:
 if "last_command_result" not in st.session_state:
     st.session_state.last_command_result = None
 
+if "mqtt_events" not in st.session_state:
+    st.session_state.mqtt_events = queue.Queue(maxsize=200)
+
+if "last_telemetry_signature" not in st.session_state:
+    st.session_state.last_telemetry_signature = None
+
+if "anomaly_result" not in st.session_state:
+    st.session_state.anomaly_result = None
+
+if "last_mqtt_timestamp" not in st.session_state:
+    st.session_state.last_mqtt_timestamp = None
+
 
 selected_lang = st.sidebar.radio(
     "🌐 Language / اللغة",
@@ -250,37 +263,73 @@ STATUS_TOPIC = "smartwater/device/status"
 
 
 def on_connect(client, userdata, flags, rc):
+    events = userdata
     if rc == 0:
-        st.session_state.mqtt_connected = True
-        st.session_state.mqtt_status = "CONNECTED"
-        client.subscribe(TELEMETRY_TOPIC)
-        client.subscribe(STATUS_TOPIC)
+        client.subscribe(TELEMETRY_TOPIC, qos=0)
+        client.subscribe(STATUS_TOPIC, qos=0)
+        events.put(("connect", 0))
     else:
-        st.session_state.mqtt_connected = False
-        st.session_state.mqtt_status = "CONNECTION_FAILED"
+        events.put(("connect", int(rc)))
 
 
 def on_disconnect(client, userdata, rc):
-    st.session_state.mqtt_connected = False
-    st.session_state.mqtt_status = "DISCONNECTED"
+    userdata.put(("disconnect", int(rc)))
 
 
 def on_message(client, userdata, message):
     try:
         payload = message.payload.decode("utf-8")
+        userdata.put(("message", message.topic, payload))
+    except UnicodeDecodeError:
+        userdata.put(("invalid",))
 
-        if message.topic == TELEMETRY_TOPIC:
-            data = json.loads(payload)
-            st.session_state.mqtt_data = data
-            st.session_state.last_mqtt_message = datetime.now().strftime(
-                "%H:%M:%S"
+
+def process_mqtt_events():
+    events = st.session_state.mqtt_events
+
+    while True:
+        try:
+            event = events.get_nowait()
+        except queue.Empty:
+            break
+
+        if event[0] == "connect":
+            connected = event[1] == 0
+            st.session_state.mqtt_connected = connected
+            st.session_state.mqtt_status = (
+                "CONNECTED" if connected else "CONNECTION_FAILED"
             )
+        elif event[0] == "disconnect":
+            st.session_state.mqtt_connected = False
+            st.session_state.mqtt_status = "DISCONNECTED"
+        elif event[0] == "invalid":
+            st.session_state.last_mqtt_message = "INVALID_MESSAGE"
+        elif event[0] == "message":
+            _, topic, payload = event
+            if topic == TELEMETRY_TOPIC:
+                try:
+                    data = json.loads(payload)
+                    if not isinstance(data, dict):
+                        raise ValueError("Telemetry must be a JSON object")
 
-        elif message.topic == STATUS_TOPIC:
-            st.session_state.mqtt_status = payload
+                    signature = json.dumps(data, sort_keys=True)
+                    st.session_state.mqtt_data = data
+                    st.session_state.last_mqtt_message = datetime.now().strftime(
+                        "%H:%M:%S"
+                    )
+                    st.session_state.last_mqtt_timestamp = datetime.now()
 
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-        st.session_state.last_mqtt_message = "INVALID_MESSAGE"
+                    if signature != st.session_state.last_telemetry_signature:
+                        st.session_state.last_telemetry_signature = signature
+                        append_history(data)
+                        try:
+                            st.session_state.anomaly_result = detect_anomaly(data)
+                        except (ValueError, TypeError, KeyError):
+                            st.session_state.anomaly_result = None
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    st.session_state.last_mqtt_message = "INVALID_MESSAGE"
+            elif topic == STATUS_TOPIC:
+                st.session_state.mqtt_status = payload
 
 
 def connect_mqtt(host, port, username, password):
@@ -298,6 +347,7 @@ def connect_mqtt(host, port, username, password):
         if username:
             client.username_pw_set(username, password)
 
+        client.user_data_set(st.session_state.mqtt_events)
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
         client.on_message = on_message
@@ -330,6 +380,11 @@ def disconnect_mqtt():
     st.session_state.mqtt_client = None
     st.session_state.mqtt_connected = False
     st.session_state.mqtt_status = "DISCONNECTED"
+    while not st.session_state.mqtt_events.empty():
+        try:
+            st.session_state.mqtt_events.get_nowait()
+        except queue.Empty:
+            break
 
 
 def send_mqtt_command(command):
@@ -735,6 +790,18 @@ def display_dashboard(data, T, hardware=False):
         else:
             st.error(T["sensor_status"] + ": " + T["not_ready"])
 
+        if st.session_state.last_mqtt_timestamp is not None:
+            age = (datetime.now() - st.session_state.last_mqtt_timestamp).total_seconds()
+            if age > 5:
+                st.warning("Telemetry is stale: no fresh ESP32 data received for more than 5 seconds.")
+
+        anomaly = st.session_state.anomaly_result
+        if anomaly and anomaly.get("anomaly"):
+            st.warning(
+                "Dashboard anomaly analysis (" + anomaly.get("severity", "UNKNOWN") + "): "
+                + "; ".join(item.get("message", item.get("type", "Anomaly")) for item in anomaly.get("detections", []))
+            )
+
     draw_charts(st.session_state.history, T)
 
 
@@ -891,6 +958,8 @@ else:
             disconnect_mqtt()
             st.rerun()
 
+    process_mqtt_events()
+
     if st.session_state.mqtt_connected:
         st.sidebar.success(T["connected"])
     else:
@@ -979,8 +1048,6 @@ else:
 
     if st.session_state.mqtt_data:
         telemetry = st.session_state.mqtt_data
-
-        append_history(telemetry)
 
         display_dashboard(
             telemetry,
