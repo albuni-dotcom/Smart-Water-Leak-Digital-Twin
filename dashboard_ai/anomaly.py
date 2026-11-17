@@ -74,10 +74,15 @@ class AnomalyDetector:
 
         return abs(current - center) / robust_sigma
 
-    def detect_statistical_anomalies(self, features):
+    def detect_statistical_anomalies(self, features, telemetry):
         detections = []
 
         for key, current in features.items():
+            if key.startswith(("P_", "Q_")) and key != "P_main" and key != "Q_main":
+                zone = key[-1]
+                if not bool(telemetry.get(f"Z{zone}", {}).get("V", 0)):
+                    continue
+
             values = self.history[key]
 
             if len(values) < self.minimum_samples:
@@ -205,8 +210,13 @@ class AnomalyDetector:
 
         return "MEDIUM"
 
-    def update_history(self, features):
+    def update_history(self, features, telemetry):
         for key, value in features.items():
+            if key.startswith(("P_", "Q_")) and key != "P_main" and key != "Q_main":
+                zone = key[-1]
+                if not bool(telemetry.get(f"Z{zone}", {}).get("V", 0)):
+                    continue
+
             self.history[key].append(value)
 
     def analyze(self, telemetry):
@@ -225,7 +235,7 @@ class AnomalyDetector:
         detections = []
 
         detections.extend(
-            self.detect_statistical_anomalies(features)
+            self.detect_statistical_anomalies(features, telemetry)
         )
 
         detections.extend(
@@ -254,7 +264,7 @@ class AnomalyDetector:
         }
 
         if not detections and not bool(telemetry.get("alarm", False)):
-            self.update_history(features)
+            self.update_history(features, telemetry)
 
         self.last_result = result
 
