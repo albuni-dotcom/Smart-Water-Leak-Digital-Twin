@@ -7,7 +7,10 @@
 #include <math.h>
 #include <string.h>
 
+#ifndef SIMULATION_MODE
 #define SIMULATION_MODE true
+#endif
+
 #define MQTT_ENABLED true
 
 #define FLOW_MAIN_PIN 27
@@ -99,6 +102,7 @@ uint8_t zoneLeakCounter[3] = {};
 
 uint32_t lastSampleTime = 0;
 uint32_t lastMqttReconnect = 0;
+uint32_t lastWifiAttempt = 0;
 
 String lastAlarm = "NONE";
 
@@ -377,21 +381,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 void connectWiFi() {
 #if !SIMULATION_MODE
+    if (WiFi.status() == WL_CONNECTED) {
+        return;
+    }
+
+    if (millis() - lastWifiAttempt < MQTT_RECONNECT_INTERVAL) {
+        return;
+    }
+
+    lastWifiAttempt = millis();
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    uint32_t startTime = millis();
-
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 20000) {
-        delay(250);
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.print("WiFi connected: ");
-        Serial.println(WiFi.localIP());
-    } else {
-        Serial.println("WiFi connection failed.");
-    }
 #endif
 }
 
@@ -571,7 +571,9 @@ void detectZoneLeaks() {
             Serial.print("Zone leak detected: ");
             Serial.println(alarmMessage);
 
+            alarmActive = true;
             lastAlarm = alarmMessage;
+            publishStatus("ALARM");
 
             zoneLeakCounter[i] = 0;
 
@@ -716,10 +718,7 @@ void loop() {
     }
 
 #if MQTT_ENABLED && !SIMULATION_MODE
-    if (WiFi.status() != WL_CONNECTED) {
-        connectWiFi();
-    }
-
+    connectWiFi();
     reconnectMQTT();
 
     if (mqttClient.connected()) {
