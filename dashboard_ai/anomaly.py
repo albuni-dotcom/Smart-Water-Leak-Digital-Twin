@@ -1,5 +1,6 @@
 
 from collections import deque
+from statistics import median
 from datetime import datetime
 import numpy as np
 
@@ -74,15 +75,10 @@ class AnomalyDetector:
 
         return abs(current - center) / robust_sigma
 
-    def detect_statistical_anomalies(self, features, telemetry):
+    def detect_statistical_anomalies(self, features):
         detections = []
 
         for key, current in features.items():
-            if key.startswith(("P_", "Q_")) and key != "P_main" and key != "Q_main":
-                zone = key[-1]
-                if not bool(telemetry.get(f"Z{zone}", {}).get("V", 0)):
-                    continue
-
             values = self.history[key]
 
             if len(values) < self.minimum_samples:
@@ -104,14 +100,10 @@ class AnomalyDetector:
 
         return detections
 
-    def detect_pressure_drop(self, features, telemetry):
+    def detect_pressure_drop(self, features):
         detections = []
 
         for zone in ["A", "B", "C"]:
-            zone_data = telemetry.get(f"Z{zone}", {})
-            if not bool(zone_data.get("V", 0)):
-                continue
-
             key = f"P_{zone}"
             values = self.history[key]
 
@@ -138,15 +130,15 @@ class AnomalyDetector:
 
         return detections
 
-    def detect_flow_imbalance(self, features, telemetry):
+    def detect_flow_imbalance(self, features):
         detections = []
 
         main_flow = features["Q_main"]
 
-        zone_flow = sum(
-            features[f"Q_{zone}"]
-            for zone in ["A", "B", "C"]
-            if bool(telemetry.get(f"Z{zone}", {}).get("V", 0))
+        zone_flow = (
+            features["Q_A"]
+            + features["Q_B"]
+            + features["Q_C"]
         )
 
         difference = abs(main_flow - zone_flow)
@@ -210,13 +202,8 @@ class AnomalyDetector:
 
         return "MEDIUM"
 
-    def update_history(self, features, telemetry):
+    def update_history(self, features):
         for key, value in features.items():
-            if key.startswith(("P_", "Q_")) and key != "P_main" and key != "Q_main":
-                zone = key[-1]
-                if not bool(telemetry.get(f"Z{zone}", {}).get("V", 0)):
-                    continue
-
             self.history[key].append(value)
 
     def analyze(self, telemetry):
@@ -235,15 +222,15 @@ class AnomalyDetector:
         detections = []
 
         detections.extend(
-            self.detect_statistical_anomalies(features, telemetry)
+            self.detect_statistical_anomalies(features)
         )
 
         detections.extend(
-            self.detect_pressure_drop(features, telemetry)
+            self.detect_pressure_drop(features)
         )
 
         detections.extend(
-            self.detect_flow_imbalance(features, telemetry)
+            self.detect_flow_imbalance(features)
         )
 
         detections.extend(
@@ -263,8 +250,7 @@ class AnomalyDetector:
             }
         }
 
-        if not detections and not bool(telemetry.get("alarm", False)):
-            self.update_history(features, telemetry)
+        self.update_history(features)
 
         self.last_result = result
 
