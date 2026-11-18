@@ -352,6 +352,7 @@ def _enqueue(userdata, item):
 
 
 def on_connect(client, userdata, flags, rc):
+    events = userdata
     if rc == 0:
         try:
             client.subscribe(TELEMETRY_TOPIC, qos=0)
@@ -1047,6 +1048,18 @@ def display_dashboard(data, T, hardware=False):
     _render_baseline_status(T, hardware=hardware)
 
     st.caption(T["elevation_note"])
+
+        if st.session_state.last_mqtt_timestamp is not None:
+            age = (datetime.now() - st.session_state.last_mqtt_timestamp).total_seconds()
+            if age > 5:
+                st.warning("Telemetry is stale: no fresh ESP32 data received for more than 5 seconds.")
+
+        anomaly = st.session_state.anomaly_result
+        if anomaly and anomaly.get("anomaly"):
+            st.warning(
+                "Dashboard anomaly analysis (" + anomaly.get("severity", "UNKNOWN") + "): "
+                + "; ".join(item.get("message", item.get("type", "Anomaly")) for item in anomaly.get("detections", []))
+            )
 
     draw_charts(st.session_state.history, T)
 

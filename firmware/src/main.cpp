@@ -619,6 +619,7 @@ void detectZoneLeaks() {
 
             alarmActive = true;
             lastAlarm = alarmMessage;
+            publishStatus("ALARM");
 
             publishStatus("ALARM");
             publishTelemetry();  // immediate update to the dashboard
