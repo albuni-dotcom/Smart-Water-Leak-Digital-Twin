@@ -1,4 +1,6 @@
 venv/
-.pio/
+.venv/
 __pycache__/
-*.zip
+*.pyc
+.pio/
+.godot/

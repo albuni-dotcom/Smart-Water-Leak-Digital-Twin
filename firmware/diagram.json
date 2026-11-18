@@ -1,66 +1,184 @@
 {
   "version": 1,
-  "author": "Shopak - Mechatronics Team",
+  "author": "Anonymous maker",
   "editor": "wokwi",
   "parts": [
-    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
-    { "type": "wokwi-led", "id": "ledA", "top": -90, "left": 180, "attrs": { "color": "green", "label": "Valve A" } },
-    { "type": "wokwi-led", "id": "ledB", "top": -90, "left": 230, "attrs": { "color": "green", "label": "Valve B" } },
-    { "type": "wokwi-led", "id": "ledC", "top": -90, "left": 280, "attrs": { "color": "green", "label": "Valve C" } },
-    { "type": "wokwi-resistor", "id": "rA", "top": -30, "left": 180, "attrs": { "value": "220" } },
-    { "type": "wokwi-resistor", "id": "rB", "top": -30, "left": 230, "attrs": { "value": "220" } },
-    { "type": "wokwi-resistor", "id": "rC", "top": -30, "left": 280, "attrs": { "value": "220" } },
-
-    { "type": "wokwi-pushbutton", "id": "btnMain", "top": 20, "left": -150, "attrs": { "color": "blue", "label": "Flow Main" } },
-    { "type": "wokwi-pushbutton", "id": "btnZA", "top": 80, "left": -150, "attrs": { "color": "yellow", "label": "Flow ZA" } },
-    { "type": "wokwi-pushbutton", "id": "btnZB", "top": 140, "left": -150, "attrs": { "color": "yellow", "label": "Flow ZB" } },
-    { "type": "wokwi-pushbutton", "id": "btnZC", "top": 200, "left": -150, "attrs": { "color": "yellow", "label": "Flow ZC" } },
-
-    { "type": "wokwi-potentiometer", "id": "potMain", "top": 20, "left": 200, "attrs": { "label": "P_Main" } },
-    { "type": "wokwi-potentiometer", "id": "potZA", "top": 90, "left": 200, "attrs": { "label": "P_ZoneA" } },
-    { "type": "wokwi-potentiometer", "id": "potZB", "top": 160, "left": 200, "attrs": { "label": "P_ZoneB" } },
-    { "type": "wokwi-potentiometer", "id": "potZC", "top": 230, "left": 200, "attrs": { "label": "P_ZoneC" } }
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-slide-potentiometer",
+      "id": "pot_main",
+      "top": -250,
+      "left": -450,
+      "attrs": { "travelLength": "30" }
+    },
+    {
+      "type": "wokwi-slide-potentiometer",
+      "id": "pot_za",
+      "top": -100,
+      "left": -450,
+      "attrs": { "travelLength": "30" }
+    },
+    {
+      "type": "wokwi-slide-potentiometer",
+      "id": "pot_zb",
+      "top": 50,
+      "left": -450,
+      "attrs": { "travelLength": "30" }
+    },
+    {
+      "type": "wokwi-slide-potentiometer",
+      "id": "pot_zc",
+      "top": 200,
+      "left": -450,
+      "attrs": { "travelLength": "30" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_main",
+      "top": -250,
+      "left": 650,
+      "attrs": { "color": "blue" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_za",
+      "top": -100,
+      "left": 650,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_zb",
+      "top": 50,
+      "left": 650,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_zc",
+      "top": 200,
+      "left": 650,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-relay-module",
+      "id": "relay_a",
+      "top": 900,
+      "left": -400,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-relay-module",
+      "id": "relay_b",
+      "top": 900,
+      "left": -100,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-relay-module",
+      "id": "relay_c",
+      "top": 900,
+      "left": 200,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_a",
+      "top": 1050,
+      "left": -400,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_b",
+      "top": 1050,
+      "left": -100,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_c",
+      "top": 1050,
+      "left": 200,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_a",
+      "top": 1200,
+      "left": -400,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_b",
+      "top": 1200,
+      "left": -100,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_c",
+      "top": 1200,
+      "left": 200,
+      "attrs": { "color": "green" }
+    }
   ],
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "", [] ],
     [ "esp:RX", "$serialMonitor:TX", "", [] ],
 
-    [ "esp:16", "rA:1", "green", [ "h0" ] ],
-    [ "rA:2", "ledA:A", "green", [ "v0" ] ],
-    [ "ledA:C", "esp:GND.2", "black", [ "v0" ] ],
+    [ "pot_main:VCC", "esp:3V3", "red", [] ],
+    [ "pot_main:GND", "esp:GND.1", "black", [] ],
+    [ "pot_main:SIG", "esp:36", "green", [] ],
+    [ "pot_za:VCC", "esp:3V3", "red", [] ],
+    [ "pot_za:GND", "esp:GND.1", "black", [] ],
+    [ "pot_za:SIG", "esp:39", "green", [] ],
+    [ "pot_zb:VCC", "esp:3V3", "red", [] ],
+    [ "pot_zb:GND", "esp:GND.1", "black", [] ],
+    [ "pot_zb:SIG", "esp:34", "green", [] ],
+    [ "pot_zc:VCC", "esp:3V3", "red", [] ],
+    [ "pot_zc:GND", "esp:GND.1", "black", [] ],
+    [ "pot_zc:SIG", "esp:35", "green", [] ],
 
-    [ "esp:17", "rB:1", "green", [ "h0" ] ],
-    [ "rB:2", "ledB:A", "green", [ "v0" ] ],
-    [ "ledB:C", "esp:GND.2", "black", [ "v0" ] ],
+    [ "btn_main:1.l", "esp:27", "orange", [] ],
+    [ "btn_main:2.r", "esp:GND.1", "black", [] ],
+    [ "btn_za:1.l", "esp:26", "orange", [] ],
+    [ "btn_za:2.r", "esp:GND.1", "black", [] ],
+    [ "btn_zb:1.l", "esp:25", "orange", [] ],
+    [ "btn_zb:2.r", "esp:GND.1", "black", [] ],
+    [ "btn_zc:1.l", "esp:33", "orange", [] ],
+    [ "btn_zc:2.r", "esp:GND.1", "black", [] ],
 
-    [ "esp:18", "rC:1", "green", [ "h0" ] ],
-    [ "rC:2", "ledC:A", "green", [ "v0" ] ],
-    [ "ledC:C", "esp:GND.2", "black", [ "v0" ] ],
+    [ "relay_a:VCC", "esp:5V", "violet", [] ],
+    [ "relay_a:GND", "esp:GND.1", "black", [] ],
+    [ "relay_a:IN", "esp:16", "green", [] ],
+    [ "relay_a:COM", "esp:3V3", "red", [] ],
+    [ "relay_a:NO", "r_a:1", "gray", [] ],
+    [ "r_a:2", "led_a:A", "gray", [] ],
+    [ "led_a:C", "esp:GND.1", "black", [] ],
 
-    [ "btnMain:1.r", "esp:27", "blue", [ "h0" ] ],
-    [ "btnMain:2.r", "esp:GND.1", "black", [ "h0" ] ],
-    [ "btnZA:1.r", "esp:26", "gold", [ "h0" ] ],
-    [ "btnZA:2.r", "esp:GND.1", "black", [ "h0" ] ],
-    [ "btnZB:1.r", "esp:25", "gold", [ "h0" ] ],
-    [ "btnZB:2.r", "esp:GND.1", "black", [ "h0" ] ],
-    [ "btnZC:1.r", "esp:33", "gold", [ "h0" ] ],
-    [ "btnZC:2.r", "esp:GND.1", "black", [ "h0" ] ],
+    [ "relay_b:VCC", "esp:5V", "violet", [] ],
+    [ "relay_b:GND", "esp:GND.1", "black", [] ],
+    [ "relay_b:IN", "esp:17", "green", [] ],
+    [ "relay_b:COM", "esp:3V3", "red", [] ],
+    [ "relay_b:NO", "r_b:1", "gray", [] ],
+    [ "r_b:2", "led_b:A", "gray", [] ],
+    [ "led_b:C", "esp:GND.1", "black", [] ],
 
-    [ "potMain:GND", "esp:GND.2", "black", [ "v0" ] ],
-    [ "potMain:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "potMain:SIG", "esp:36", "purple", [ "h0" ] ],
-
-    [ "potZA:GND", "esp:GND.2", "black", [ "v0" ] ],
-    [ "potZA:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "potZA:SIG", "esp:39", "orange", [ "h0" ] ],
-
-    [ "potZB:GND", "esp:GND.2", "black", [ "v0" ] ],
-    [ "potZB:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "potZB:SIG", "esp:34", "orange", [ "h0" ] ],
-
-    [ "potZC:GND", "esp:GND.2", "black", [ "v0" ] ],
-    [ "potZC:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "potZC:SIG", "esp:35", "orange", [ "h0" ] ]
-  ]
+    [ "relay_c:VCC", "esp:5V", "violet", [] ],
+    [ "relay_c:GND", "esp:GND.1", "black", [] ],
+    [ "relay_c:IN", "esp:18", "green", [] ],
+    [ "relay_c:COM", "esp:3V3", "red", [] ],
+    [ "relay_c:NO", "r_c:1", "gray", [] ],
+    [ "r_c:2", "led_c:A", "gray", [] ],
+    [ "led_c:C", "esp:GND.1", "black", [] ]
+  ],
+  "dependencies": {}
 }
-
