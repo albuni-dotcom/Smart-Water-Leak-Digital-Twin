@@ -1,31 +1,8 @@
-"""
-Smart Water Leak Detection & Isolation System — Streamlit Dashboard.
-
-Modes
------
-* Simulation: the dashboard runs an in-process digital twin of the
-  firmware. Raw sensor values are generated with elevation-aware
-  physics; the same direct rules as firmware/src/main.cpp are applied
-  with 3-sample confirmation; and anomaly.py runs in parallel as an
-  advisory statistical layer.
-
-* Hardware: the dashboard connects to an MQTT broker, subscribes to
-  the ESP32 telemetry/status topics, and lets the operator open/close
-  valves. anomaly.py runs on every fresh telemetry message.
-
-Both modes share the same thresholds (imported from anomaly.py) so the
-dashboard and the firmware cannot silently diverge.
-
-Safety
-------
-RESET clears the alarm and keeps every valve CLOSED. The operator must
-explicitly OPEN the branches after verifying the cause has been fixed.
-"""
-
 from anomaly import (
     detect_anomaly,
     reset_detector,
-    MAIN_FLOW_ERROR_LIMIT,
+    reset_zone_detector,
+    MAIN_FLOW_ERROR,
     MAIN_FLOW_MIN_Q,
     MAIN_PRESSURE_LIMIT,
     MAIN_PRESSURE_SUMQ_MAX,
@@ -34,7 +11,6 @@ from anomaly import (
     MICRO_LEAK_PRESSURE,
     ELEVATION_COMPENSATION_KPA,
 )
-
 import json
 import queue
 import time
@@ -44,44 +20,35 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
 try:
     import paho.mqtt.client as mqtt
     MQTT_AVAILABLE = True
 except ImportError:
     MQTT_AVAILABLE = False
-
-
-# ============================================================
-# Configuration — MUST match firmware/src/main.cpp
-# ============================================================
 ALARM_CONFIRMATION_COUNT = 3
 
-TOPIC_PREFIX     = "smartwater/shopak2026"
-COMMAND_TOPIC    = f"{TOPIC_PREFIX}/device/cmd"
-TELEMETRY_TOPIC  = f"{TOPIC_PREFIX}/device/telemetry"
-STATUS_TOPIC     = f"{TOPIC_PREFIX}/device/status"
-
+TOPIC_PREFIX = "smartwater/shopak2026"
+COMMAND_TOPIC = f"{TOPIC_PREFIX}/device/cmd"
+TELEMETRY_TOPIC = f"{TOPIC_PREFIX}/device/telemetry"
+STATUS_TOPIC = f"{TOPIC_PREFIX}/device/status"
 INITIAL_TANK_VOLUME_L = 14.5
-TANK_TOP_AREA_CM2     = 750.0   # 30 cm x 25 cm
-TANK_COLUMN_M         = 1.50    # main static head at the manifold
-BRANCH_FRICTION_K     = 0.6     # kPa per (L/min) along a branch
-MAIN_FRICTION_K       = 0.45    # kPa per (L/min) along the main line
-BURST_LEAK_DROP_KPA   = 5.5
-MICRO_LEAK_DROP_KPA   = 1.8
+TANK_TOP_AREA_CM2 = 750.0
+TANK_COLUMN_M = 1.50
+BRANCH_FRICTION_K = 0.6
+MAIN_FRICTION_K = 0.45
+BURST_LEAK_DROP_KPA = 5.5
+MICRO_LEAK_DROP_KPA = 1.8
 MANIFOLD_LEAK_DROP_KPA = 4.5
 MANIFOLD_LEAK_FLOW_LPM = 3.2
-
-
-# ============================================================
-# Language strings
-# ============================================================
 LANG = {
     "العربية": {
         "title": "💧 نظام كشف وعزل تسربات المياه الذكي",
         "subtitle": "لوحة المراقبة والتحكم في شبكة المياه",
         "language": "اللغة",
         "mode": "وضع التشغيل",
+        "reset_zone": "إعادة ضبط الفرع",
+        "twin_3d_title": "🌐 المجسم الهيدروليكي ثلاثي الأبعاد (التوأم الرقمي الحي)",
+        "tank_empty_alarm": "⚠️ تنبيه حرج: الخزان الرئيسي فارغ أو حساس الضغط الرئيسي مفصول!",
         "simulation": "المحاكاة",
         "hardware": "الاتصال بالنظام الحقيقي",
         "connection": "إعدادات الاتصال",
@@ -164,6 +131,9 @@ LANG = {
         "subtitle": "Water Network Monitoring and Control Dashboard",
         "language": "Language",
         "mode": "Operating Mode",
+        "reset_zone": "Reset Zone",
+        "twin_3d_title": "🌐 3D Hydraulic Digital Twin (Live View)",
+        "tank_empty_alarm": "⚠️ Critical: Main tank is empty or main pressure sensor disconnected!",
         "simulation": "Simulation",
         "hardware": "Real Hardware Connection",
         "connection": "Connection Settings",
@@ -242,100 +212,63 @@ LANG = {
         "reset_note_sim": "After RESET all valves remain CLOSED for safety. Use the OPEN buttons above to restart.",
     },
 }
-
-
-# ============================================================
-# Streamlit page configuration
-# ============================================================
 st.set_page_config(
     page_title="Smart Water Leak Detection",
     page_icon="💧",
     layout="wide",
 )
-
-
-# ============================================================
-# Session state initialisation
-# ============================================================
 def _init_session_state():
     if "history" not in st.session_state:
         st.session_state.history = []
-
     if "water_volume" not in st.session_state:
         st.session_state.water_volume = INITIAL_TANK_VOLUME_L
-
     if "sim_valves" not in st.session_state:
         st.session_state.sim_valves = {"A": True, "B": True, "C": True}
-
     if "sim_alarm" not in st.session_state:
         st.session_state.sim_alarm = False
-
+    if "sim_main_alarm" not in st.session_state:
+        st.session_state.sim_main_alarm = False
+    if "sim_zone_alarms" not in st.session_state:
+        st.session_state.sim_zone_alarms = {"A": False, "B": False, "C": False}
     if "sim_alarm_type" not in st.session_state:
         st.session_state.sim_alarm_type = "NONE"
-
     if "sim_p_ref" not in st.session_state:
         initial_height = (
             (INITIAL_TANK_VOLUME_L * 1000.0) / TANK_TOP_AREA_CM2 / 100.0
         )
         st.session_state.sim_p_ref = 9.81 * (TANK_COLUMN_M + initial_height)
-
     if "sim_main_counter" not in st.session_state:
         st.session_state.sim_main_counter = 0
-
     if "sim_zone_counters" not in st.session_state:
         st.session_state.sim_zone_counters = {"A": 0, "B": 0, "C": 0}
-
     if "last_sim_time" not in st.session_state:
         st.session_state.last_sim_time = time.time()
-
     if "mqtt_client" not in st.session_state:
         st.session_state.mqtt_client = None
-
     if "mqtt_connected" not in st.session_state:
         st.session_state.mqtt_connected = False
-
     if "mqtt_data" not in st.session_state:
         st.session_state.mqtt_data = {}
-
     if "mqtt_status" not in st.session_state:
         st.session_state.mqtt_status = "DISCONNECTED"
-
     if "last_mqtt_message" not in st.session_state:
         st.session_state.last_mqtt_message = None
-
     if "last_command_result" not in st.session_state:
         st.session_state.last_command_result = None
-
     if "mqtt_events" not in st.session_state:
         st.session_state.mqtt_events = queue.Queue(maxsize=200)
-
     if "last_telemetry_signature" not in st.session_state:
         st.session_state.last_telemetry_signature = None
-
     if "anomaly_result" not in st.session_state:
         st.session_state.anomaly_result = None
-
     if "last_mqtt_timestamp" not in st.session_state:
         st.session_state.last_mqtt_timestamp = None
-
     if "previous_mode" not in st.session_state:
         st.session_state.previous_mode = None
-
     if "pending_disconnect" not in st.session_state:
         st.session_state.pending_disconnect = False
-
-
 _init_session_state()
-
-
-# ============================================================
-# MQTT callbacks
-# ============================================================
 def _enqueue(userdata, item):
-    """Non-blocking enqueue: drop the oldest item if the queue is full.
-    This prevents the paho network thread from blocking on a full queue
-    (which would break keepalive and disconnect the client).
-    """
     try:
         userdata.put_nowait(item)
     except queue.Full:
@@ -349,8 +282,6 @@ def _enqueue(userdata, item):
             pass
     except Exception:
         pass
-
-
 def on_connect(client, userdata, flags, rc):
     events = userdata
     if rc == 0:
@@ -362,12 +293,8 @@ def on_connect(client, userdata, flags, rc):
         _enqueue(userdata, ("connect", 0))
     else:
         _enqueue(userdata, ("connect", int(rc)))
-
-
 def on_disconnect(client, userdata, rc):
     _enqueue(userdata, ("disconnect", int(rc)))
-
-
 def on_message(client, userdata, message):
     try:
         payload = message.payload.decode("utf-8")
@@ -376,23 +303,16 @@ def on_message(client, userdata, message):
         _enqueue(userdata, ("invalid",))
     except Exception:
         _enqueue(userdata, ("invalid",))
-
-
-# ============================================================
-# MQTT management
-# ============================================================
 def connect_mqtt(host, port, username, password):
     if not MQTT_AVAILABLE:
         st.session_state.mqtt_status = "MISSING_LIBRARY"
         return False
-
     try:
         disconnect_mqtt()
 
         client = mqtt.Client(
             client_id=f"smartwater_dashboard_shopak2026_{int(time.time())}"
         )
-
         if username:
             client.username_pw_set(username, password)
 
@@ -400,26 +320,18 @@ def connect_mqtt(host, port, username, password):
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
         client.on_message = on_message
-
-        # connect_async does not block the Streamlit thread; the network
-        # loop reports success via on_connect, or keeps retrying.
         client.connect_async(host, int(port), keepalive=30)
         client.loop_start()
-
         st.session_state.mqtt_client = client
         st.session_state.mqtt_status = "CONNECTING"
         return True
-
     except Exception as exc:
         st.session_state.mqtt_connected = False
         st.session_state.mqtt_status = str(exc)
         st.session_state.mqtt_client = None
         return False
-
-
 def disconnect_mqtt():
     client = st.session_state.get("mqtt_client")
-
     if client is not None:
         try:
             client.loop_stop()
@@ -429,26 +341,20 @@ def disconnect_mqtt():
             client.disconnect()
         except Exception:
             pass
-
     st.session_state.mqtt_client = None
     st.session_state.mqtt_connected = False
     st.session_state.mqtt_status = "DISCONNECTED"
     st.session_state.last_telemetry_signature = None
-
     while True:
         try:
             st.session_state.mqtt_events.get_nowait()
         except queue.Empty:
             break
-
-
 def send_mqtt_command(command):
     client = st.session_state.get("mqtt_client")
-
     if client is None:
         st.session_state.last_command_result = "FAILED"
         return False
-
     try:
         if not client.is_connected():
             st.session_state.last_command_result = "FAILED"
@@ -456,26 +362,19 @@ def send_mqtt_command(command):
     except Exception:
         st.session_state.last_command_result = "FAILED"
         return False
-
     try:
         payload = json.dumps(command)
         result = client.publish(COMMAND_TOPIC, payload, qos=1)
-
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             st.session_state.last_command_result = "SENT"
             return True
-
         st.session_state.last_command_result = "FAILED"
         return False
-
     except Exception:
         st.session_state.last_command_result = "FAILED"
         return False
-
-
 def process_mqtt_events():
     events = st.session_state.mqtt_events
-
     while True:
         try:
             event = events.get_nowait()
@@ -483,7 +382,6 @@ def process_mqtt_events():
             break
         except Exception:
             break
-
         if event[0] == "connect":
             connected = event[1] == 0
             st.session_state.mqtt_connected = connected
@@ -500,150 +398,105 @@ def process_mqtt_events():
                 _, topic, payload = event
             except ValueError:
                 continue
-
             if topic == TELEMETRY_TOPIC:
                 try:
                     data = json.loads(payload)
                 except json.JSONDecodeError:
                     st.session_state.last_mqtt_message = "INVALID_MESSAGE"
                     continue
-
                 if not isinstance(data, dict):
                     st.session_state.last_mqtt_message = "INVALID_MESSAGE"
                     continue
-
-                # Reject payloads that do not match the agreed schema.
-                # The firmware now always sends the full JSON, so a
-                # missing key indicates a genuine protocol violation.
                 required_keys = (
-                    "P_main", "Q_main", "ZA", "ZB", "ZC",
+                    "P_main", "Q_main", "A", "B", "C",
                     "alarm", "alarm_type", "sensor_ready",
                 )
                 if not all(k in data for k in required_keys):
                     st.session_state.last_mqtt_message = "INVALID_MESSAGE"
                     continue
-
                 signature = json.dumps(data, sort_keys=True)
                 st.session_state.mqtt_data = data
                 st.session_state.last_mqtt_message = datetime.now().strftime(
                     "%H:%M:%S"
                 )
                 st.session_state.last_mqtt_timestamp = datetime.now()
-
                 if signature != st.session_state.last_telemetry_signature:
                     st.session_state.last_telemetry_signature = signature
                     append_history(data)
-
                     try:
                         st.session_state.anomaly_result = detect_anomaly(data)
                     except (ValueError, TypeError, KeyError, AttributeError):
                         st.session_state.anomaly_result = None
-
             elif topic == STATUS_TOPIC:
                 st.session_state.mqtt_status = payload
-
-
-# ============================================================
-# History helpers
-# ============================================================
 def append_history(data):
     try:
         row = {
             "Time": datetime.now().strftime("%H:%M:%S"),
             "P_Main": float(data.get("P_main", 0.0)),
-            "P_A":    float((data.get("ZA") or {}).get("P", 0.0)),
-            "P_B":    float((data.get("ZB") or {}).get("P", 0.0)),
-            "P_C":    float((data.get("ZC") or {}).get("P", 0.0)),
+            "P_A":    float((data.get("A") or {}).get("P", 0.0)),
+            "P_B":    float((data.get("B") or {}).get("P", 0.0)),
+            "P_C":    float((data.get("C") or {}).get("P", 0.0)),
             "Q_Main": float(data.get("Q_main", 0.0)),
-            "Q_A":    float((data.get("ZA") or {}).get("Q", 0.0)),
-            "Q_B":    float((data.get("ZB") or {}).get("Q", 0.0)),
-            "Q_C":    float((data.get("ZC") or {}).get("Q", 0.0)),
+            "Q_A":    float((data.get("A") or {}).get("Q", 0.0)),
+            "Q_B":    float((data.get("B") or {}).get("Q", 0.0)),
+            "Q_C":    float((data.get("C") or {}).get("Q", 0.0)),
         }
     except (TypeError, ValueError, AttributeError):
         return
-
     st.session_state.history.append(row)
     st.session_state.history = st.session_state.history[-60:]
-
-
 def add_simulation_history(data):
     try:
         row = {
             "Time": datetime.now().strftime("%H:%M:%S"),
             "P_Main": float(data["P_main"]),
-            "P_A":    float(data["ZA"]["P"]),
-            "P_B":    float(data["ZB"]["P"]),
-            "P_C":    float(data["ZC"]["P"]),
+            "P_A":    float(data["A"]["P"]),
+            "P_B":    float(data["B"]["P"]),
+            "P_C":    float(data["C"]["P"]),
             "Q_Main": float(data["Q_main"]),
-            "Q_A":    float(data["ZA"]["Q"]),
-            "Q_B":    float(data["ZB"]["Q"]),
-            "Q_C":    float(data["ZC"]["Q"]),
+            "Q_A":    float(data["A"]["Q"]),
+            "Q_B":    float(data["B"]["Q"]),
+            "Q_C":    float(data["C"]["Q"]),
         }
     except (KeyError, TypeError, ValueError):
         return
-
     st.session_state.history.append(row)
     st.session_state.history = st.session_state.history[-60:]
-
-
-# ============================================================
-# Simulation: physics
-# ------------------------------------------------------------
-# Raw readings are what the ADS1115 would actually see. Because the
-# branch sensors sit 0.44 m below the main sensor, their raw readings
-# are ~4.316 kPa HIGHER than the main sensor at the same hydraulic
-# point. Detection compares compensated values; the dashboard shows
-# raw values (exactly what the firmware publishes).
-# ============================================================
 def _calculate_zone_flow(valve_open, needle_percent, burst, micro):
     if not valve_open:
         return 0.0, 0.0
-
     normal_flow = (needle_percent / 100.0) * 1.8
-
     if burst:
         leak_flow = 2.8
     elif micro:
         leak_flow = 0.22
     else:
         leak_flow = 0.0
-
     true_flow = normal_flow + leak_flow
-
-    # YF-S401 dead-band ~0.3 L/min: any true flow below that is
-    # measured as 0 by the pulse counter.
     measured_flow = 0.0 if true_flow < 0.3 else max(
         0.0,
         true_flow + np.random.normal(0, 0.03),
     )
-
     return true_flow, measured_flow
-
-
 def _compute_physics(
     needle_a, needle_b, needle_c,
     leak_a, leak_b, micro_c, manifold_leak,
 ):
     valves = st.session_state.sim_valves
-
     q_true_a, q_a = _calculate_zone_flow(valves["A"], needle_a, leak_a, False)
     q_true_b, q_b = _calculate_zone_flow(valves["B"], needle_b, leak_b, False)
     q_true_c, q_c = _calculate_zone_flow(valves["C"], needle_c, False, micro_c)
-
     q_manifold = MANIFOLD_LEAK_FLOW_LPM if manifold_leak else 0.0
     q_true_main = q_true_a + q_true_b + q_true_c + q_manifold
-
     q_main_measured = 0.0 if q_true_main < 1.0 else max(
         0.0,
         q_true_main + np.random.normal(0, 0.05),
     )
-
     tank_height = (
         st.session_state.water_volume * 1000.0
     ) / TANK_TOP_AREA_CM2 / 100.0
-
     p_static = 9.81 * (TANK_COLUMN_M + tank_height)
-
     p_main = max(
         0.5,
         p_static
@@ -651,10 +504,6 @@ def _compute_physics(
         - (MANIFOLD_LEAK_DROP_KPA if manifold_leak else 0.0)
         + np.random.normal(0, 0.08),
     )
-
-    # Branch raw pressure = main pressure + elevation head - friction
-    # - leak drop. The 4.316 kPa elevation head is what the branch
-    # sensor physically reads in excess of the main sensor.
     p_a_raw = max(
         0.0,
         p_main + ELEVATION_COMPENSATION_KPA
@@ -662,7 +511,6 @@ def _compute_physics(
         - (BURST_LEAK_DROP_KPA if leak_a else 0.0)
         + np.random.normal(0, 0.08),
     ) if valves["A"] else 0.0
-
     p_b_raw = max(
         0.0,
         p_main + ELEVATION_COMPENSATION_KPA
@@ -670,7 +518,6 @@ def _compute_physics(
         - (BURST_LEAK_DROP_KPA if leak_b else 0.0)
         + np.random.normal(0, 0.08),
     ) if valves["B"] else 0.0
-
     p_c_raw = max(
         0.0,
         p_main + ELEVATION_COMPENSATION_KPA
@@ -678,7 +525,6 @@ def _compute_physics(
         - (MICRO_LEAK_DROP_KPA if micro_c else 0.0)
         + np.random.normal(0, 0.08),
     ) if valves["C"] else 0.0
-
     return {
         "q_true_main": q_true_main,
         "p_main": p_main,
@@ -690,21 +536,9 @@ def _compute_physics(
         "q_b": q_b,
         "q_c": q_c,
     }
-
-
-# ============================================================
-# Simulation: firmware-equivalent detection
-# ------------------------------------------------------------
-# Mirrors firmware/src/main.cpp exactly:
-#   * same thresholds (imported from anomaly.py)
-#   * elevation compensation applied before zone comparisons
-#   * 3-sample confirmation before triggering
-#   * RESET keeps every valve closed
-# ============================================================
 def _apply_detection(physics):
     p_main = physics["p_main"]
     q_main = physics["q_main"]
-
     q_zones = {
         "A": physics["q_a"],
         "B": physics["q_b"],
@@ -716,21 +550,19 @@ def _apply_detection(physics):
         "C": max(0.0, physics["p_c_raw"] - ELEVATION_COMPENSATION_KPA),
     }
     valve_open = dict(st.session_state.sim_valves)
-
-    # --- Main manifold leak ---
+    all_closed = not any(valve_open.values())
     sum_q = q_zones["A"] + q_zones["B"] + q_zones["C"]
     flow_diff = abs(q_main - sum_q)
-
     pressure_drop = (
-        st.session_state.sim_p_ref > 1.0
+        all_closed
+        and st.session_state.sim_p_ref > 1.0
         and p_main < st.session_state.sim_p_ref * MAIN_PRESSURE_LIMIT
         and sum_q < MAIN_PRESSURE_SUMQ_MAX
     )
     flow_imbalance = (
         q_main > MAIN_FLOW_MIN_Q
-        and flow_diff > MAIN_FLOW_ERROR_LIMIT
+        and flow_diff > MAIN_FLOW_ERROR
     )
-
     if pressure_drop or flow_imbalance:
         st.session_state.sim_main_counter = min(
             ALARM_CONFIRMATION_COUNT,
@@ -738,30 +570,23 @@ def _apply_detection(physics):
         )
     else:
         st.session_state.sim_main_counter = 0
-
     if st.session_state.sim_main_counter >= ALARM_CONFIRMATION_COUNT:
+        st.session_state.sim_main_alarm = True
         st.session_state.sim_alarm = True
         st.session_state.sim_alarm_type = "MAIN_MANIFOLD_LEAK"
         st.session_state.sim_valves = {"A": False, "B": False, "C": False}
         st.session_state.sim_main_counter = 0
         return
-
-    # --- Zone leaks ---
     for zone in ("A", "B", "C"):
-        if not valve_open[zone]:
+        if not valve_open[zone] or st.session_state.sim_zone_alarms[zone]:
             st.session_state.sim_zone_counters[zone] = 0
             continue
-
-        ratio = (
-            p_zones_comp[zone] / p_main if p_main > 0.5 else 1.0
-        )
-
+        ratio = p_zones_comp[zone] / p_main if p_main > 0.5 else 1.0
         pressure_ratio_drop = ratio < ZONE_PRESSURE_LIMIT
         micro_leak = (
             q_zones[zone] < MICRO_LEAK_FLOW_MAX
             and p_zones_comp[zone] < MICRO_LEAK_PRESSURE * p_main
         )
-
         if pressure_ratio_drop or micro_leak:
             st.session_state.sim_zone_counters[zone] = min(
                 ALARM_CONFIRMATION_COUNT,
@@ -769,15 +594,12 @@ def _apply_detection(physics):
             )
         else:
             st.session_state.sim_zone_counters[zone] = 0
-
         if st.session_state.sim_zone_counters[zone] >= ALARM_CONFIRMATION_COUNT:
+            st.session_state.sim_zone_alarms[zone] = True
             st.session_state.sim_alarm = True
             st.session_state.sim_alarm_type = f"ZONE_{zone}_LEAK"
             st.session_state.sim_valves[zone] = False
             st.session_state.sim_zone_counters[zone] = 0
-            return  # one zone per tick, mirroring firmware
-
-
 def run_simulation_tick(
     needle_a, needle_b, needle_c,
     leak_a, leak_b, micro_c, manifold_leak,
@@ -786,22 +608,18 @@ def run_simulation_tick(
         needle_a, needle_b, needle_c,
         leak_a, leak_b, micro_c, manifold_leak,
     )
-
-    # Build the preliminary telemetry BEFORE detection so the anomaly
-    # detector sees the physical state (open valves, flow present)
-    # rather than the post-isolation state.
     preliminary = {
         "P_main": physics["p_main"],
         "Q_main": physics["q_main"],
-        "ZA": {
+        "A": {
             "P": physics["p_a_raw"], "Q": physics["q_a"],
             "V": int(st.session_state.sim_valves["A"]),
         },
-        "ZB": {
+        "B": {
             "P": physics["p_b_raw"], "Q": physics["q_b"],
             "V": int(st.session_state.sim_valves["B"]),
         },
-        "ZC": {
+        "C": {
             "P": physics["p_c_raw"], "Q": physics["q_c"],
             "V": int(st.session_state.sim_valves["C"]),
         },
@@ -809,43 +627,35 @@ def run_simulation_tick(
         "alarm_type": st.session_state.sim_alarm_type,
         "sensor_ready": True,
     }
-
-    # Advisory statistical layer.
     try:
         st.session_state.anomaly_result = detect_anomaly(preliminary)
     except (ValueError, TypeError, KeyError, AttributeError):
         st.session_state.anomaly_result = None
 
-    # Firmware-equivalent detection.
-    if not st.session_state.sim_alarm:
-        _apply_detection(physics)
+    _apply_detection(physics)
 
-    # Tank drain (uses true flow, not measured, so consumption is
-    # physically accurate regardless of dead-band effects).
     elapsed = max(
         0.0,
         min(time.time() - st.session_state.last_sim_time, 5.0),
     )
     st.session_state.last_sim_time = time.time()
-
     st.session_state.water_volume = max(
         0.0,
         st.session_state.water_volume
         - (physics["q_true_main"] / 60.0) * elapsed,
     )
-
     final_telemetry = {
         "P_main": physics["p_main"],
         "Q_main": physics["q_main"],
-        "ZA": {
+        "A": {
             "P": physics["p_a_raw"], "Q": physics["q_a"],
             "V": int(st.session_state.sim_valves["A"]),
         },
-        "ZB": {
+        "B": {
             "P": physics["p_b_raw"], "Q": physics["q_b"],
             "V": int(st.session_state.sim_valves["B"]),
         },
-        "ZC": {
+        "C": {
             "P": physics["p_c_raw"], "Q": physics["q_c"],
             "V": int(st.session_state.sim_valves["C"]),
         },
@@ -853,27 +663,121 @@ def run_simulation_tick(
         "alarm_type": st.session_state.sim_alarm_type,
         "sensor_ready": True,
     }
-
     add_simulation_history(final_telemetry)
     return final_telemetry
-
-
-# ============================================================
-# Display helpers
-# ============================================================
+def draw_3d_system(data, T, hardware=False):
+    st.subheader(T["twin_3d_title"])
+    za = data.get("A") or {}
+    zb = data.get("B") or {}
+    zc = data.get("C") or {}
+    valves = {
+        "A": bool(int(za.get("V", 0) or 0)),
+        "B": bool(int(zb.get("V", 0) or 0)),
+        "C": bool(int(zc.get("V", 0) or 0)),
+    }
+    flows = {
+        "main": float(data.get("Q_main", 0.0)),
+        "A": float(za.get("Q", 0.0)),
+        "B": float(zb.get("Q", 0.0)),
+        "C": float(zc.get("Q", 0.0)),
+    }
+    pressures = {
+        "main": float(data.get("P_main", 0.0)),
+        "A": float(za.get("P", 0.0)),
+        "B": float(zb.get("P", 0.0)),
+        "C": float(zc.get("P", 0.0)),
+    }
+    alarm = bool(data.get("alarm", False))
+    alarm_type = str(data.get("alarm_type", "NONE"))
+    fig = go.Figure()
+    tank_ratio = 0.75 if hardware else max(0.05, min(1.0, st.session_state.water_volume / INITIAL_TANK_VOLUME_L))
+    water_top_z = 2.0 + (1.2 * tank_ratio)
+    fig.add_trace(go.Scatter3d(
+        x=[0, 0], y=[0, 0], z=[2.0, 3.2],
+        mode="lines", line=dict(color="rgba(150, 180, 210, 0.35)", width=28),
+        hoverinfo="skip"
+    ))
+    fig.add_trace(go.Scatter3d(
+        x=[0, 0], y=[0, 0], z=[2.0, water_top_z],
+        mode="lines+text", line=dict(color="#00B4D8", width=22),
+        text=["", f"Tank: {pressures['main']:.1f} kPa"], textposition="top center",
+    ))
+    main_leaking = alarm and ("MAIN" in alarm_type)
+    main_color = "#FF2A2A" if main_leaking else ("#0096C7" if flows["main"] > 0.1 else "#4A5568")
+    fig.add_trace(go.Scatter3d(
+        x=[0, 0, 0], y=[0, 0, 0], z=[2.0, 1.2, 0.8],
+        mode="lines", line=dict(color=main_color, width=14),
+    ))
+    fig.add_trace(go.Scatter3d(
+        x=[-1.5, 0, 1.5], y=[0, 0, 0], z=[0.8, 0.8, 0.8],
+        mode="lines", line=dict(color=main_color, width=12),
+    ))
+    if main_leaking:
+        fig.add_trace(go.Scatter3d(
+            x=[0.12, -0.12, 0.06, -0.08], y=[0.2, 0.25, -0.2, 0.15], z=[1.1, 0.9, 1.0, 0.85],
+            mode="markers+text", marker=dict(size=9, color="#FF0000", symbol="diamond"),
+            text=["💥 MAIN LEAK", "", "", ""], textposition="top center",
+        ))
+    zone_x = {"A": -1.5, "B": 0.0, "C": 1.5}
+    phase = (time.time() * 2.0) % 1.0
+    for z_name, x_pos in zone_x.items():
+        is_open = valves[z_name]
+        is_leaking = alarm and (f"ZONE_{z_name}" in alarm_type)
+        has_flow = is_open and (flows[z_name] > 0.05 or is_leaking)
+        pipe_color = "#FF2A2A" if is_leaking else ("#00B4D8" if is_open else "#2D3748")
+        valve_color = "#FF0000" if is_leaking else ("#10B981" if is_open else "#718096")
+        fig.add_trace(go.Scatter3d(
+            x=[x_pos, x_pos, x_pos], y=[0.0, 0.0, 1.2], z=[0.8, 0.4, -0.4],
+            mode="lines", line=dict(color=pipe_color, width=9),
+        ))
+        fig.add_trace(go.Scatter3d(
+            x=[x_pos], y=[0.0], z=[0.4],
+            mode="markers+text",
+            marker=dict(size=14, color=valve_color, line=dict(color="white", width=2)),
+            text=[f"Valve {z_name}<br>{'OPEN' if is_open else 'CLOSED'}"],
+            textposition="middle right",
+        ))
+        if has_flow:
+            p1_y = 1.2 * phase
+            p1_z = 0.4 - 0.8 * phase
+            fig.add_trace(go.Scatter3d(
+                x=[x_pos], y=[p1_y], z=[p1_z],
+                mode="markers", marker=dict(size=7, color="#90E0EF"),
+                hoverinfo="skip"
+            ))
+        if is_leaking:
+            fig.add_trace(go.Scatter3d(
+                x=[x_pos + 0.1, x_pos - 0.1, x_pos],
+                y=[0.7, 0.8, 0.75],
+                z=[-0.1, -0.2, 0.0],
+                mode="markers+text",
+                marker=dict(size=10, color="#FF0000", symbol="x"),
+                text=[f"💥 LEAK {z_name}", "", ""], textposition="top center",
+            ))
+    fig.update_layout(
+        height=440,
+        margin=dict(l=0, r=0, t=10, b=0),
+        scene=dict(
+            xaxis=dict(visible=False, range=[-2.2, 2.2]),
+            yaxis=dict(visible=False, range=[-0.6, 1.8]),
+            zaxis=dict(visible=False, range=[-0.7, 3.5]),
+            camera=dict(eye=dict(x=1.4, y=-1.6, z=0.9)),
+            aspectmode="manual",
+            aspectratio=dict(x=1.2, y=0.8, z=1.1),
+        ),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 def draw_charts(history, T):
     if not history:
         st.info(T["no_data"])
         return
-
     try:
         df = pd.DataFrame(history)
     except Exception:
         st.info(T["no_data"])
         return
-
     chart_col1, chart_col2 = st.columns(2)
-
     with chart_col1:
         fig_pressure = go.Figure()
         for column, name in [
@@ -898,7 +802,6 @@ def draw_charts(history, T):
             margin=dict(l=15, r=15, t=50, b=15),
         )
         st.plotly_chart(fig_pressure, use_container_width=True)
-
     with chart_col2:
         fig_flow = go.Figure()
         for column, name in [
@@ -923,13 +826,10 @@ def draw_charts(history, T):
             margin=dict(l=15, r=15, t=50, b=15),
         )
         st.plotly_chart(fig_flow, use_container_width=True)
-
-
 def _render_anomaly_banner(T):
     anomaly = st.session_state.get("anomaly_result")
     if not anomaly or not anomaly.get("anomaly"):
         return
-
     severity = anomaly.get("severity", "UNKNOWN")
     messages = "; ".join(
         item.get("message", item.get("type", "Anomaly"))
@@ -937,13 +837,10 @@ def _render_anomaly_banner(T):
     )
     if messages:
         st.warning(f"{T['anomaly_header']} ({severity}): {messages}")
-
-
 def _render_baseline_status(T, hardware=False):
     anomaly = st.session_state.get("anomaly_result")
     if not anomaly:
         return
-
     ready = anomaly.get("baseline_ready", False)
     if ready:
         st.caption(f"✅ {T['baseline_ready']}")
@@ -955,13 +852,10 @@ def _render_baseline_status(T, hardware=False):
         )
         if collecting:
             st.caption(f"⏳ {T['baseline_collecting']} — {collecting}")
-
-
 def display_dashboard(data, T, hardware=False):
-    zone_a = data.get("ZA") or {}
-    zone_b = data.get("ZB") or {}
-    zone_c = data.get("ZC") or {}
-
+    zone_a = data.get("A") or {}
+    zone_b = data.get("B") or {}
+    zone_c = data.get("C") or {}
     try:
         p_main = float(data.get("P_main", 0.0))
         q_main = float(data.get("Q_main", 0.0))
@@ -974,27 +868,22 @@ def display_dashboard(data, T, hardware=False):
     except (TypeError, ValueError):
         st.error("Invalid telemetry payload — values could not be cast to float.")
         return
-
     v_a = bool(int(zone_a.get("V", 0) or 0))
     v_b = bool(int(zone_b.get("V", 0) or 0))
     v_c = bool(int(zone_c.get("V", 0) or 0))
-
     alarm = bool(data.get("alarm", False))
     alarm_type = data.get("alarm_type", "NONE")
-
-    if alarm:
+    if alarm_type == "LOW_TANK_LEVEL":
+        st.error(T["tank_empty_alarm"])
+    elif alarm:
         st.error(f"{T['alarm']} — {alarm_type}")
     else:
         st.success(T["normal"])
-
-    # KPI row
     c1, c2, c3, c4, c5 = st.columns(5)
-
     if hardware:
         tank_value = "N/A"
     else:
         tank_value = f"{st.session_state.water_volume:.2f} L"
-
     c1.metric(T["tank"], tank_value)
     c2.metric(T["pressure"], f"{p_main:.2f} kPa")
     c3.metric(T["main_flow"], f"{q_main:.2f} L/min")
@@ -1004,16 +893,13 @@ def display_dashboard(data, T, hardware=False):
     c5.metric(
         T["zone_b"], f"{q_b:.2f} L/min", f"{p_b:.2f} kPa"
     )
-
     st.subheader(T["zone_status"])
-
     zone_cols = st.columns(3)
     zone_data = [
         (T["zone_a"], p_a, q_a, v_a),
         (T["zone_b"], p_b, q_b, v_b),
         (T["zone_c"], p_c, q_c, v_c),
     ]
-
     for col, (name, pressure, flow, valve) in zip(zone_cols, zone_data):
         with col:
             st.metric(name, f"{flow:.2f} L/min", f"{pressure:.2f} kPa")
@@ -1021,19 +907,16 @@ def display_dashboard(data, T, hardware=False):
                 st.success(f"{T['valve']}: {T['opened']}")
             else:
                 st.error(f"{T['valve']}: {T['closed']}")
-
     if hardware:
         st.caption(
             f"{T['last_update']}: "
             f"{st.session_state.last_mqtt_message or T['telemetry_wait']}"
         )
-
         sensor_ready = data.get("sensor_ready", False)
         if sensor_ready:
             st.success(f"{T['sensor_status']}: {T['ready']}")
         else:
             st.error(f"{T['sensor_status']}: {T['not_ready']}")
-
         if st.session_state.last_mqtt_timestamp is not None:
             age = (
                 datetime.now() - st.session_state.last_mqtt_timestamp
@@ -1043,82 +926,43 @@ def display_dashboard(data, T, hardware=False):
                     "Telemetry is stale: no fresh ESP32 data for more "
                     f"than 5 seconds (age = {age:.1f}s)."
                 )
-
     _render_anomaly_banner(T)
     _render_baseline_status(T, hardware=hardware)
-
     st.caption(T["elevation_note"])
 
+    draw_3d_system(data, T, hardware=hardware)
     draw_charts(st.session_state.history, T)
-
-
-# ============================================================
-# UI entry point
-# ============================================================
 selected_lang = st.sidebar.radio(
     "🌐 Language / اللغة",
     ["العربية", "English"],
     horizontal=True,
 )
 T = LANG[selected_lang]
-rtl = selected_lang == "العربية"
-
-st.markdown(
-    f"""
-    <style>
-    .main .block-container {{
-        direction: {"rtl" if rtl else "ltr"};
-        text-align: {"right" if rtl else "left"};
-    }}
-    div[data-testid="stMetric"] {{
-        text-align: {"right" if rtl else "left"};
-    }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 st.title(T["title"])
 st.markdown(T["subtitle"])
-
 mode = st.sidebar.radio(
     T["mode"],
     [T["simulation"], T["hardware"]],
     index=0,
 )
 simulation_mode = mode == T["simulation"]
-
-
-# -------- Mode switch cleanup --------
 if st.session_state.previous_mode != mode:
     st.session_state.previous_mode = mode
     st.session_state.history = []
     st.session_state.anomaly_result = None
     st.session_state.last_telemetry_signature = None
     reset_detector()
-
     if simulation_mode:
-        # Leaving hardware mode — shut down the MQTT client.
         disconnect_mqtt()
     else:
-        # Entering hardware mode — freeze simulation state, do not
-        # carry any sim leak counters into the hardware dashboard.
+        st.session_state.sim_main_alarm = False
+        st.session_state.sim_zone_alarms = {"A": False, "B": False, "C": False}
         st.session_state.sim_main_counter = 0
         st.session_state.sim_zone_counters = {"A": 0, "B": 0, "C": 0}
-
-
 st.sidebar.divider()
-
-
-# ============================================================
-# SIMULATION MODE
-# ============================================================
 if simulation_mode:
     st.sidebar.info(T["simulation_note"])
-
-    # --- Fault and consumption sliders ---
     st.sidebar.subheader(T["simulation_controls"])
-
     needle_a = st.sidebar.slider(
         f"{T['zone_a']} — {T['needle']}", 0, 100, 40,
         key="sim_needle_a",
@@ -1131,23 +975,23 @@ if simulation_mode:
         f"{T['zone_c']} — {T['needle']}", 0, 100, 0,
         key="sim_needle_c",
     )
-
     st.sidebar.subheader(T["leaks"])
-
     leak_a = st.sidebar.checkbox(T["leak_a"], key="sim_leak_a")
     leak_b = st.sidebar.checkbox(T["leak_b"], key="sim_leak_b")
     micro_c = st.sidebar.checkbox(T["micro_c"], key="sim_micro_c")
     manifold_leak = st.sidebar.checkbox(T["main_leak"], key="sim_main_leak")
-
     st.sidebar.divider()
-
-    # --- Manual valve controls (needed after RESET) ---
     st.sidebar.subheader(T["sim_valve_controls"])
-
     valve_cols = st.sidebar.columns(2)
     with valve_cols[0]:
-        if st.button(T["open_all"], use_container_width=True):
-            st.session_state.sim_valves = {"A": True, "B": True, "C": True}
+        if st.button(
+            T["open_all"],
+            use_container_width=True,
+            disabled=st.session_state.sim_main_alarm,
+        ):
+            for z in ("A", "B", "C"):
+                if not st.session_state.sim_zone_alarms[z]:
+                    st.session_state.sim_valves[z] = True
             st.session_state.sim_main_counter = 0
             st.session_state.sim_zone_counters = {"A": 0, "B": 0, "C": 0}
             st.rerun()
@@ -1155,15 +999,15 @@ if simulation_mode:
         if st.button(T["close_all"], use_container_width=True):
             st.session_state.sim_valves = {"A": False, "B": False, "C": False}
             st.rerun()
-
     for zone in ("A", "B", "C"):
-        cols = st.sidebar.columns(2)
+        cols = st.sidebar.columns(3)
+        is_locked = st.session_state.sim_main_alarm or st.session_state.sim_zone_alarms[zone]
         with cols[0]:
             if st.button(
                 f"{T['open']} {zone}",
                 key=f"sim_open_{zone}",
                 use_container_width=True,
-                disabled=st.session_state.sim_valves[zone],
+                disabled=st.session_state.sim_valves[zone] or is_locked,
             ):
                 st.session_state.sim_valves[zone] = True
                 st.session_state.sim_zone_counters[zone] = 0
@@ -1177,11 +1021,27 @@ if simulation_mode:
             ):
                 st.session_state.sim_valves[zone] = False
                 st.rerun()
-
+        with cols[2]:
+            if st.button(
+                f"Reset {zone}",
+                key=f"sim_reset_{zone}",
+                use_container_width=True,
+                disabled=not st.session_state.sim_zone_alarms[zone],
+            ):
+                st.session_state.sim_zone_alarms[zone] = False
+                st.session_state.sim_zone_counters[zone] = 0
+                st.session_state.sim_valves[zone] = False
+                st.session_state.sim_alarm = (
+                    st.session_state.sim_main_alarm or any(st.session_state.sim_zone_alarms.values())
+                )
+                if not st.session_state.sim_alarm:
+                    st.session_state.sim_alarm_type = "NONE"
+                reset_zone_detector(zone)
+                st.rerun()
     st.sidebar.divider()
-
-    # --- RESET (clears alarm + closes valves + resets detector) ---
     if st.sidebar.button(T["reset"], use_container_width=True):
+        st.session_state.sim_main_alarm = False
+        st.session_state.sim_zone_alarms = {"A": False, "B": False, "C": False}
         st.session_state.sim_alarm = False
         st.session_state.sim_alarm_type = "NONE"
         st.session_state.sim_main_counter = 0
@@ -1191,11 +1051,11 @@ if simulation_mode:
         reset_detector()
         st.sidebar.info(T["reset_note_sim"])
         st.rerun()
-
-    # --- RESET SIM (full restart) ---
     if st.sidebar.button(T["reset_sim"], use_container_width=True):
         st.session_state.water_volume = INITIAL_TANK_VOLUME_L
         st.session_state.sim_valves = {"A": True, "B": True, "C": True}
+        st.session_state.sim_main_alarm = False
+        st.session_state.sim_zone_alarms = {"A": False, "B": False, "C": False}
         st.session_state.sim_alarm = False
         st.session_state.sim_alarm_type = "NONE"
         st.session_state.sim_main_counter = 0
@@ -1205,36 +1065,23 @@ if simulation_mode:
         st.session_state.last_sim_time = time.time()
         reset_detector()
         st.rerun()
-
-    # --- Refill tank ---
     if st.sidebar.button(T["refill_tank"], use_container_width=True):
         st.session_state.water_volume = INITIAL_TANK_VOLUME_L
         st.rerun()
-
-    # --- Advance simulation one tick ---
     simulation_data = run_simulation_tick(
         needle_a, needle_b, needle_c,
         leak_a, leak_b, micro_c, manifold_leak,
     )
-
     if st.session_state.water_volume < 2.0:
         st.warning(T["tank_low_warning"])
-
     display_dashboard(simulation_data, T, hardware=False)
-
-
-# ============================================================
-# HARDWARE MODE
-# ============================================================
 else:
     st.sidebar.subheader(T["connection"])
-
     if not MQTT_AVAILABLE:
         st.sidebar.error(T["mqtt_missing"])
         st.error(T["mqtt_missing"])
         st.code("pip install 'paho-mqtt<2.0.0'")
         st.stop()
-
     broker_host = st.sidebar.text_input(
         T["broker"], value="broker.hivemq.com",
     )
@@ -1245,16 +1092,13 @@ else:
     broker_password = st.sidebar.text_input(
         T["password"], value="", type="password",
     )
-
     st.sidebar.subheader(T["mqtt_topics"])
     st.sidebar.code(
         f"{T['command_topic']}: {COMMAND_TOPIC}\n"
         f"{T['telemetry_topic']}: {TELEMETRY_TOPIC}\n"
         f"{T['status_topic']}: {STATUS_TOPIC}"
     )
-
     connect_col, disconnect_col = st.sidebar.columns(2)
-
     with connect_col:
         if st.button(T["connect"], use_container_width=True):
             if connect_mqtt(
@@ -1262,51 +1106,41 @@ else:
                 broker_username, broker_password,
             ):
                 st.rerun()
-
     with disconnect_col:
         if st.button(T["disconnect"], use_container_width=True):
             disconnect_mqtt()
             st.rerun()
 
-    # Refresh connected state from the paho client (source of truth).
     client = st.session_state.get("mqtt_client")
     if client is not None:
         try:
             st.session_state.mqtt_connected = bool(client.is_connected())
         except Exception:
             st.session_state.mqtt_connected = False
-
     process_mqtt_events()
-
     if st.session_state.mqtt_connected:
         st.sidebar.success(T["connected"])
     else:
         st.sidebar.error(T["disconnected"])
-
     st.sidebar.info(T["hardware_note"])
     if not st.session_state.mqtt_connected:
         st.warning(T["hardware_warning"])
-
     st.subheader(T["hardware_controls"])
-
     valve_columns = st.columns(3)
     for index, zone in enumerate(["A", "B", "C"]):
         with valve_columns[index]:
             st.markdown(f"### {T['zone_' + zone.lower()]}")
-
             current_data = st.session_state.mqtt_data or {}
-            zone_data = current_data.get("Z" + zone) or {}
+            zone_data = current_data.get(zone) or {}
             try:
                 valve_is_open = bool(int(zone_data.get("V", 0) or 0))
             except (TypeError, ValueError):
                 valve_is_open = False
-
             if valve_is_open:
                 st.success(T["opened"])
             else:
                 st.error(T["closed"])
-
-            open_col, close_col = st.columns(2)
+            open_col, close_col, z_reset_col = st.columns(3)
             with open_col:
                 if st.button(
                     T["open"],
@@ -1329,9 +1163,19 @@ else:
                         st.toast(T["command_sent"])
                     else:
                         st.error(T["command_failed"])
-
+            with z_reset_col:
+                if st.button(
+                    f"Reset {zone}",
+                    key=f"hw_reset_{zone}",
+                    use_container_width=True,
+                    disabled=not st.session_state.mqtt_connected,
+                ):
+                    if send_mqtt_command({f"RESET_{zone}": 1}):
+                        st.toast(T["command_sent"])
+                        reset_zone_detector(zone)
+                    else:
+                        st.error(T["command_failed"])
     all_open_col, all_close_col, reset_col = st.columns(3)
-
     with all_open_col:
         if st.button(
             T["open_all"],
@@ -1342,7 +1186,6 @@ else:
                 st.toast(T["command_sent"])
             else:
                 st.error(T["command_failed"])
-
     with all_close_col:
         if st.button(
             T["close_all"],
@@ -1353,7 +1196,6 @@ else:
                 st.toast(T["command_sent"])
             else:
                 st.error(T["command_failed"])
-
     with reset_col:
         if st.button(
             T["reset"],
@@ -1366,7 +1208,6 @@ else:
                 reset_detector()
             else:
                 st.error(T["command_failed"])
-
     if st.session_state.mqtt_data:
         display_dashboard(
             st.session_state.mqtt_data, T, hardware=True,
@@ -1379,9 +1220,5 @@ else:
     ):
         st.caption(f"{T['status']}: {st.session_state.mqtt_status}")
 
-
-# ============================================================
-# Advance one tick
-# ============================================================
 time.sleep(1)
 st.rerun()

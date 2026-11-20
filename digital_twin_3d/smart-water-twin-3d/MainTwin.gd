@@ -210,13 +210,13 @@ func _poll_udp() -> void:
 # Telemetry application
 # ============================================================
 func _apply_telemetry(data: Dictionary) -> void:
-	# --- Flow → shader speed ---
+	# --- Flow -> shader speed ---
 	var q_main := float(data.get("Q_main", 0.0))
 	if _pipe_main_mat != null:
 		_pipe_main_mat.set_shader_parameter("flow_speed", clampf(q_main, 0.0, 4.0))
 
 	for i in ZONES.size():
-		var zone_data = data.get("Z" + ZONES[i], {})
+		var zone_data = data.get(ZONES[i], {})
 		var q_zone := 0.0
 		if zone_data is Dictionary:
 			q_zone = float(zone_data.get("Q", 0.0))
@@ -227,7 +227,7 @@ func _apply_telemetry(data: Dictionary) -> void:
 
 	# --- Valve colors ---
 	for i in ZONES.size():
-		var zone_data = data.get("Z" + ZONES[i], {})
+		var zone_data = data.get(ZONES[i], {})
 		var v_open := false
 		if zone_data is Dictionary:
 			v_open = int(zone_data.get("V", 0)) == 1
@@ -241,6 +241,9 @@ func _apply_telemetry(data: Dictionary) -> void:
 
 	# --- Leak particles ---
 	var alarm_type := str(data.get("alarm_type", "NONE"))
+	if alarm_type == "LOW_TANK_LEVEL":
+		_tank_volume_l = 0.0
+
 	for i in ZONES.size():
 		if i < _leak_emitters.size():
 			_leak_emitters[i].emitting = (
@@ -250,6 +253,7 @@ func _apply_telemetry(data: Dictionary) -> void:
 		_main_leak_emitter.emitting = (alarm_type == "MAIN_MANIFOLD_LEAK")
 
 	_update_ui()
+
 
 
 func _update_tank_level(delta: float) -> void:
@@ -653,7 +657,7 @@ func _build_ui() -> void:
 	var controls := PanelContainer.new()
 	controls.anchor_left = 1.0
 	controls.anchor_right = 1.0
-	controls.offset_left = -260
+	controls.offset_left = -310
 	controls.offset_right = -16
 	controls.offset_top = 16
 	layer.add_child(controls)
@@ -673,7 +677,7 @@ func _build_ui() -> void:
 		var zone_name: String = ZONES[i]
 		var open_btn := Button.new()
 		open_btn.text = "Open " + zone_name
-		open_btn.custom_minimum_size = Vector2(110, 32)
+		open_btn.custom_minimum_size = Vector2(90, 32)
 		open_btn.pressed.connect(
 			func() -> void: _send_command({zone_name: 1})
 		)
@@ -681,11 +685,19 @@ func _build_ui() -> void:
 
 		var close_btn := Button.new()
 		close_btn.text = "Close " + zone_name
-		close_btn.custom_minimum_size = Vector2(110, 32)
+		close_btn.custom_minimum_size = Vector2(90, 32)
 		close_btn.pressed.connect(
 			func() -> void: _send_command({zone_name: 0})
 		)
 		row.add_child(close_btn)
+
+		var reset_z_btn := Button.new()
+		reset_z_btn.text = "Reset " + zone_name
+		reset_z_btn.custom_minimum_size = Vector2(95, 32)
+		reset_z_btn.pressed.connect(
+			func() -> void: _send_command({"RESET_" + zone_name: 1})
+		)
+		row.add_child(reset_z_btn)
 
 		controls_vbox.add_child(row)
 
